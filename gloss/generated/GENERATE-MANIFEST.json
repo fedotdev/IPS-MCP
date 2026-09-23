@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": null,
+  "sourceFiles": [
+    "D:\\IPS\\IPS-MCP\\gloss\\Все типы объектов_Список_23.09.26 13.55.23.xlsx",
+    "D:\\IPS\\IPS-MCP\\gloss\\Все атрибуты_Список_23.09.26 13.55.39.xlsx",
+    "D:\\IPS\\IPS-MCP\\gloss\\Типы связей_Список_23.09.26 13.56.37.xlsx"
+  ],
+  "counts": {
+    "objectTypes": 986,
+    "attributeTypes": 6542,
+    "relationTypes": 89
+  },
+  "databaseId": null,
+  "ipsVersion": null,
+  "metadataGeneration": null,
+  "validation": {
+    "duplicateIds": 0,
+    "invalidGuids": 0,
+    "emptyNames": 0
+  }
+}
