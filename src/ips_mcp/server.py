@@ -7,10 +7,19 @@
 import json
 import os
 import sys
+import time
+from datetime import datetime, timezone
 
 from . import ips
 
 KNOWN_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
+
+
+def _audit_line(path, rec):
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
 def _err(resp):
@@ -47,33 +56,48 @@ def build_tools(client, gloss):
         },
         {
             "name": "ips_get_object_attributes",
-            "description": "Получить значения всех атрибутов объекта IPS. Каждый атрибут с attributeId и attributeName.",
-            "schema": {"type": "object", "properties": {"object_id": {"type": "integer"}},
+            "description": "Получить значения атрибутов объекта IPS. Поддерживает пагинацию: page, page_size. Массив атрибутов.",
+            "schema": {"type": "object",
+                       "properties": {"object_id": {"type": "integer"},
+                                      "page": {"type": "integer"},
+                                      "page_size": {"type": "integer"}},
                        "required": ["object_id"]},
-            "call": lambda c, g, a: ips.decorate_attrs(
-                c.request("GET", f"/core/api/objects/{a['object_id']}/attributesValues"), g),
+            "call": lambda c, g, a: ips.paged(
+                ips.resolve_object_links(
+                    c, g, ips.decorate_attrs(
+                        c.request("GET", f"/core/api/objects/{a['object_id']}/attributesValues"), g)),
+                a.get("page"), a.get("page_size")),
         },
         {
             "name": "ips_get_composition",
-            "description": "Получить состав объекта: пары object+relation с ID объекта, версии и связи.",
-            "schema": {"type": "object", "properties": {"project_version_id": {"type": "integer"}},
+            "description": "Получить состав объекта: пары object+relation. Поддерживает пагинацию: page, page_size.",
+            "schema": {"type": "object",
+                       "properties": {"project_version_id": {"type": "integer"},
+                                      "page": {"type": "integer"},
+                                      "page_size": {"type": "integer"}},
                        "required": ["project_version_id"]},
-            "call": lambda c, g, a: ips.decorate_composition(
-                c.request("POST", f"/core/api/objects/{a['project_version_id']}/composition",
-                          json={}), g),
+            "call": lambda c, g, a: ips.paged(
+                ips.decorate_composition(
+                    c.request("POST", f"/core/api/objects/{a['project_version_id']}/composition",
+                              json={}), g),
+                a.get("page"), a.get("page_size")),
         },
         {
             "name": "ips_get_composition_filtered",
-            "description": "Получить состав объекта с фильтром по типу связи и типам частей.",
+            "description": "Получить состав объекта с фильтром по типу связи и типам частей. Поддерживает пагинацию: page, page_size.",
             "schema": {"type": "object",
                        "properties": {"project_version_id": {"type": "integer"},
                                       "relation_type_id": {"type": "integer"},
-                                      "part_type_ids": {"type": "array", "items": {"type": "integer"}}},
+                                      "part_type_ids": {"type": "array", "items": {"type": "integer"}},
+                                      "page": {"type": "integer"},
+                                      "page_size": {"type": "integer"}},
                        "required": ["project_version_id"]},
-            "call": lambda c, g, a: ips.decorate_composition(
-                c.request("POST", f"/core/api/objects/{a['project_version_id']}/compositionWithParams",
-                          json={"relationTypeId": a.get("relation_type_id"),
-                                "partTypeIds": a.get("part_type_ids")}), g),
+            "call": lambda c, g, a: ips.paged(
+                ips.decorate_composition(
+                    c.request("POST", f"/core/api/objects/{a['project_version_id']}/compositionWithParams",
+                              json={"relationTypeId": a.get("relation_type_id"),
+                                    "partTypeIds": a.get("part_type_ids")}), g),
+                a.get("page"), a.get("page_size")),
         },
         {
             "name": "ips_get_relation",
@@ -85,11 +109,17 @@ def build_tools(client, gloss):
         },
         {
             "name": "ips_get_relation_attributes",
-            "description": "Получить значения атрибутов связи IPS по relationID.",
-            "schema": {"type": "object", "properties": {"relation_id": {"type": "integer"}},
+            "description": "Получить значения атрибутов связи IPS по relationID. Поддерживает пагинацию: page, page_size.",
+            "schema": {"type": "object",
+                       "properties": {"relation_id": {"type": "integer"},
+                                      "page": {"type": "integer"},
+                                      "page_size": {"type": "integer"}},
                        "required": ["relation_id"]},
-            "call": lambda c, g, a: ips.decorate_attrs(
-                c.request("GET", f"/core/api/relations/{a['relation_id']}/attributesValues"), g),
+            "call": lambda c, g, a: ips.paged(
+                ips.resolve_object_links(
+                    c, g, ips.decorate_attrs(
+                        c.request("GET", f"/core/api/relations/{a['relation_id']}/attributesValues"), g)),
+                a.get("page"), a.get("page_size")),
         },
         {
             "name": "ips_get_object_type",
@@ -162,9 +192,10 @@ def _composition_tree(client, gloss, args):
 
 
 class McpServer:
-    def __init__(self, client, gloss):
+    def __init__(self, client, gloss, audit_path=None):
         self._tools = build_tools(client, gloss)
         self._by_name = {t["name"]: t for t in self._tools}
+        self._audit_path = audit_path
 
     def _result(self, msg_id, result):
         return {"jsonrpc": "2.0", "id": msg_id, "result": result}
@@ -200,16 +231,28 @@ class McpServer:
             tool = self._by_name.get(name)
             if tool is None:
                 return self._tool_error(rid, f"неизвестный инструмент: {name}")
+            t0 = time.monotonic()
+            status = "ok"
             try:
                 out = tool["call"](args)
                 text = json.dumps(out, ensure_ascii=False, indent=2)
-                return {
+                result = {
                     "jsonrpc": "2.0", "id": rid,
                     "result": {"content": [{"type": "text", "text": text}]}}
             except ips.IpsError as e:
-                return self._tool_error(rid, str(e) + f"\nIPS detail: {e.detail}")
+                status = "error"
+                result = self._tool_error(rid, str(e) + f"\nIPS detail: {e.detail}")
             except Exception as e:  # never show tokens/creds to client
-                return self._tool_error(rid, f"внутренняя ошибка: {type(e).__name__}")
+                status = "error"
+                result = self._tool_error(rid, f"внутренняя ошибка: {type(e).__name__}")
+            _audit_line(self._audit_path, {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "tool": name,
+                "inputs": args,
+                "duration_ms": round((time.monotonic() - t0) * 1000),
+                "status": status,
+            })
+            return result
 
         return self._tool_error(rid, f"метод не поддерживается: {method}")
 
@@ -222,13 +265,14 @@ def run():
     gloss_db = os.environ.get("IPS_GLOSS_DB",
                               os.path.join(os.path.dirname(__file__),
                                            "..", "..", "gloss", "generated", "gloss.db"))
+    audit_path = os.environ.get("IPS_AUDIT_LOG")
     if not login or not password:
         sys.stderr.write("IPS_LOGIN и IPS_PASSWORD обязательны\n")
         sys.exit(2)
 
     client = ips.IpsClient(base, login, password, role_id=role_id)
     gloss = ips.load_gloss(gloss_db) if os.path.exists(gloss_db) else {}
-    server = McpServer(client, gloss)
+    server = McpServer(client, gloss, audit_path=audit_path)
 
     for line in sys.stdin:
         line = line.strip()

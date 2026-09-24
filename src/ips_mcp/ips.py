@@ -3,6 +3,7 @@
 import logging
 import sqlite3
 import threading
+import time
 
 import httpx
 
@@ -51,18 +52,28 @@ class IpsClient:
             headers = dict(kw.pop("headers", {}))
             if self._token:
                 headers["Authorization"] = "Bearer " + self._token
-            resp = self._http.request(method, self._base + path,
-                                      headers=headers, **kw)
+            try:
+                resp = self._http.request(method, self._base + path,
+                                          headers=headers, **kw)
+            except httpx.HTTPError as e:
+                # ponytail: ретрай только сетевых и 5xx, не 4xx; запись не ретраится (в MVP записей нет)
+                if attempt == 0:
+                    time.sleep(0.3)
+                    continue
+                raise IpsError(0, f"сетевая ошибка: {type(e).__name__}", path)
             if resp.status_code == 401 and attempt == 0:
                 if self._refresh:
                     self._refresh_tokens()
                 else:
                     self._authenticate()
                 continue
+            if resp.status_code >= 500 and attempt == 0:
+                time.sleep(0.3)
+                continue
             if resp.status_code >= 400:
                 raise IpsError(resp.status_code, resp.text[:500], path)
             return resp.json()
-        raise IpsError(401, "не удалось обновить токен", path)
+        raise IpsError(0, "запрос не удался после повторов", path)
 
     def _authenticate(self):
         resp = self._http.post(self._base + "/core/api/Auth/authenticate", json={
@@ -135,3 +146,51 @@ def decorate_composition(items, gloss):
         }
         for p in items
     ]
+
+
+def paged(items, page=1, page_size=50):
+    total = len(items)
+    page_size = max(1, min(page_size or 50, 1000))
+    page = max(1, page or 1)
+    start = (page - 1) * page_size
+    return {
+        "items": items[start:start + page_size],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "has_more": start + page_size < total,
+    }
+
+
+def resolve_object_links(client, gloss, attrs, cap=10):
+    """Разворачивает ftObjectLink-атрибуты: числовой ID -> {id, objectType, caption}.
+
+    Ограничение |cap| запросов к IPS за один вызов инструмента,
+    чтобы не превращать чтение в веер HTTP-запросов.
+    """
+    out, resolved = [], 0
+    for it in attrs:
+        it = dict(it)
+        values = it.get("values") or []
+        if it.get("attributeType") == "ftObjectLink" and values and resolved < cap:
+            links = []
+            for v in values:
+                if v is None:
+                    links.append(None)
+                    continue
+                try:
+                    obj = client.request("GET", f"/core/api/objects/{v}").get("entity") or {}
+                except IpsError:
+                    obj = {}
+                links.append({
+                    "id": v,
+                    "objectType": obj.get("objectType"),
+                    "objectTypeName": gloss["object_types"].get(obj.get("objectType")),
+                    "caption": obj.get("caption"),
+                })
+                resolved += 1
+                if resolved >= cap:
+                    break
+            it["resolvedValues"] = links
+        out.append(it)
+    return out

@@ -93,6 +93,44 @@ def test_mapper():
     assert attrs[0]["attributeName"] == "Номер объекта"
 
 
+def test_paged():
+    items = list(range(103))
+    p = ips.paged(items, page=1, page_size=100)
+    assert p["total"] == 103 and len(p["items"]) == 100 and p["has_more"] is True
+    p2 = ips.paged(items, page=2, page_size=100)
+    assert len(p2["items"]) == 3 and p2["has_more"] is False
+    assert ips.paged(items, page=0, page_size=0)["page"] == 1
+    assert ips.paged(items, page_size=5000)["page_size"] == 1000
+
+
+def test_resolve_object_links():
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.path)
+        return httpx.Response(200, json={"entity": {"objectID": 7,
+                                                    "objectType": 1110,
+                                                    "caption": "Цехозаход 1"}})
+
+    c = ips.IpsClient("http://x", "u", "p")
+    c._token = "t"
+    c._http = handler_with(handler)
+    gloss = {"object_types": {1110: "Цехозаход"}}
+    attrs = [
+        {"attributeId": 1, "attributeType": "ftObjectLink",
+         "values": [7], "attributeName": "Ссылка"},
+        {"attributeId": 2, "attributeType": "string", "values": ["x"]},
+        {"attributeId": 3, "attributeType": "ftObjectLink",
+         "values": [7, 8]},
+    ]
+    out = ips.resolve_object_links(c, gloss, attrs, cap=2)
+    assert out[0]["resolvedValues"][0]["caption"] == "Цехозаход 1"
+    assert out[0]["resolvedValues"][0]["objectTypeName"] == "Цехозаход"
+    assert "resolvedValues" not in out[1]
+    # кап 2 запроса: ссылки атрибута 3 не разворачиваются полностью
+    assert len(calls) == 2, calls
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

@@ -55,11 +55,12 @@ createDate, guid, readOnly.
 
 ## Нормализация (правила mapper)
 
-1. `ftObjectLink`/числовые ссылки на объект разворачивать в `{id, type, designation, name}`.
+1. `ftObjectLink`/числовые ссылки на объект разворачивать в `{id, type, designation, name}`
+   (реализовано: `resolvedValues` = `{id, objectType, objectTypeName, caption}`, лимит 10 ссылок на вызов).
 2. Числовые атрибуты маппить в имена через справочник `gloss.db` (подсказка), а актуальное значение — из Web API.
 3. Всегда возвращать `objectID`/`id`/`versionID` рядом с читаемыми полями.
 4. Убирать внутренние служебные поля, вложенность > 2 уровней — уплощать/пагинировать.
-5. Пагинация list-инструментов: `{items, total, page, page_size, has_more}`.
+5. Пагинация list-инструментов: `{items, total, page, page_size, has_more}` (страницы 1-based, page_size 1..1000, default 50).
 
 ## Запись (следующий этап, НЕ в read-only MVP)
 
