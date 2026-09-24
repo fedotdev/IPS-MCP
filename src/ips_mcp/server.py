@@ -362,7 +362,28 @@ class McpServer:
         return self._tool_error(rid, f"метод не поддерживается: {method}")
 
 
+CONFIG_ENV_KEYS = ("IPS_LOGIN", "IPS_PASSWORD", "IPS_BASE_URL", "IPS_ROLE_ID",
+                   "IPS_GLOSS_DB", "IPS_AUDIT_LOG", "IPS_ENABLE_WRITE")
+
+
+def load_config(path):
+    """Загружает config.json, заполняя окружение. Приоритет: явные env > файл."""
+    if not path or not os.path.exists(path):
+        return
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError) as e:
+        sys.stderr.write(f"IPS-MCP: предупреждение: не удалось прочитать {path}: {e}\n")
+        return
+    for key in CONFIG_ENV_KEYS:
+        value = data.get(key)
+        if value is not None and not os.environ.get(key):
+            os.environ[key] = str(value)
+
+
 def run():
+    load_config(os.environ.get("IPS_CONFIG", "config.json"))
     base = os.environ.get("IPS_BASE_URL", "http://192.168.80.70:8080")
     login = os.environ.get("IPS_LOGIN")
     password = os.environ.get("IPS_PASSWORD")
@@ -371,15 +392,27 @@ def run():
                               os.path.join(os.path.dirname(__file__),
                                            "..", "..", "gloss", "generated", "gloss.db"))
     audit_path = os.environ.get("IPS_AUDIT_LOG")
-    enable_write = os.environ.get("IPS_ENABLE_WRITE") == "1"
+    enable_write = os.environ.get("IPS_ENABLE_WRITE", "").strip().lower() in {"1", "true", "yes", "on"}
     if not login or not password:
-        sys.stderr.write("IPS_LOGIN и IPS_PASSWORD обязательны\n")
+        sys.stderr.write(
+            "IPS_LOGIN и IPS_PASSWORD обязательны\n"
+            "Задайте их в переменных окружения, например (Windows):\n"
+            "  setx IPS_LOGIN \"user\"\n"
+            "  setx IPS_PASSWORD \"password\"\n"
+            "setx применяется только к НОВЫМ процессам: откройте новый терминал"
+            " или перезапустите opencode/IDE и повторите запуск.\n")
         sys.exit(2)
 
     client = ips.IpsClient(base, login, password, role_id=role_id)
     gloss = ips.load_gloss(gloss_db) if os.path.exists(gloss_db) else {}
     server = McpServer(client, gloss, audit_path=audit_path,
                        enable_write=enable_write)
+
+    sys.stderr.write(
+        f"IPS-MCP: вход выполнен как {login} "
+        f"(роль {role_id}, базовый URL {base})\n"
+        "IPS-MCP: ожидание MCP-запросов из stdin; "
+        "stdout зарезервирован под протокол.\n")
 
     for line in sys.stdin:
         line = line.strip()
