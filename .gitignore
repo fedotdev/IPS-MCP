@@ -1,1 +1,18 @@
+# SDK и крупные бинарные/внешние источники
 IPS SDK/
+gloss/*.xlsx
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Сгенерированная база знаний (воспроизводится: python gloss/generate_gloss.py)
+gloss/generated/.build/
+gloss/generated/gloss.db
+gloss/generated/*.json
+gloss/generated/GENERATE-MANIFEST.json
+
+# Секреты
+.env

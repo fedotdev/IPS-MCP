@@ -29,17 +29,17 @@ generated/
 └─ relation-types.by-id.json
 ```
 
-До запуска генератора должны существовать только план и схема. Нельзя создавать пустые `gloss.db` или JSON-файлы, выдавая их за актуальные справочники.
+До запуска генератора должны существовать только план, схема и сам генератор. Нельзя создавать пустые `gloss.db` или JSON-файлы, выдавая их за актуальные справочники.
 
 ## Источники на текущий момент
 
-Проверенная выгрузка от 23.09.2026:
+Проверенная выгрузка от 23.09.2026 (файлы в `gloss/`):
 
-- типы объектов: 986 строк, ID уникальны;
-- типы атрибутов: 6542 строки, ID уникальны;
-- типы связей: 89 строк, ID уникальны.
+- `All-objects-list.xlsx`: 986 данных (ID уникальны);
+- `All-attributes-list.xlsx`: 6542 данных (ID уникальны);
+- `All-links-list.xlsx`: 89 данных (ID уникальны).
 
-В каждом Excel-файле первая строка — путь/заголовок отчёта, вторая строка — заголовки таблицы. При импорте пропускать первую строку и использовать вторую как header.
+В каждом Excel-файле первая строка — путь/заголовок отчёта, вторая строка — заголовки таблицы. Импорт пропускает первую строку и использует вторую как header. Заголовки совпадают с фактическим набором колонок из файлов; колонки бывших выгрузок с русскими именами в `sourceFiles` manifest не используются.
 
 ## Основной runtime-формат
 
@@ -59,56 +59,79 @@ JSON-файлы — производный экспорт для диагнос�
 
 ### object_types
 
-Поля:
+Поля (источник — `All-objects-list.xlsx`, первая колонка `Идентификатор типа объектов`):
 
 - `id INTEGER PRIMARY KEY`;
-- `name TEXT NOT NULL`;
-- `full_name TEXT`;
-- `object_name TEXT`;
-- `object_type TEXT`;
-- `guid TEXT`;
-- `parent_id INTEGER`;
-- `description TEXT`;
-- `category TEXT`;
-- `source_file TEXT`;
+- `name TEXT NOT NULL` (`Наименование типа объектов`);
+- `object_name TEXT` (`Наименование объекта`);
+- `versioning TEXT` (`Версионность`);
+- `comment TEXT` (`Комментарии`);
+- `default_relation TEXT` (`Связь по умолчанию`);
+- `guid TEXT` (`Глобальный идентификатор`);
+- `domain TEXT` (`Предметная область`);
+- `descriptor_attribute TEXT` (`Атрибут-описатель`);
+- `any_attribute TEXT` (`Возможность присвоения любого атрибута`);
+- `lifecycle TEXT` (`Жизненный цикл объектов`);
+- `short_name TEXT` (`Краткое наименование`);
+- `deleted_lifetime TEXT` (`Время жизни удалённых объектов`);
+- `options TEXT` (`Опции`);
+- `lifecycle_schema_id TEXT` (`Идентификатор схемы ЖЦ`);
+- `source_file TEXT NOT NULL`;
 - `source_modified_at TEXT`.
 
 Индексы: `name`, `guid`.
 
 ### attribute_types
 
-Поля:
+Поля (источник — `All-attributes-list.xlsx`, первая колонка `Идентификатор атрибута`):
 
 - `id INTEGER PRIMARY KEY`;
-- `name TEXT NOT NULL`;
-- `short_name TEXT`;
-- `alias TEXT`;
-- `guid TEXT`;
-- `data_type TEXT`;
-- `options TEXT`;
-- `default_value TEXT`;
-- `formula TEXT`;
-- `note TEXT`;
-- `multiple_valued TEXT`;
-- `computed TEXT`;
-- `size_type TEXT`;
-- `is_content TEXT`;
-- `source_file TEXT`;
+- `name TEXT NOT NULL` (`Наименование`);
+- `short_name TEXT` (`Краткое наименование`);
+- `alias TEXT` (`Псевдоним`);
+- `comment TEXT` (`Комментарии`);
+- `data_type TEXT` (`Тип данных`);
+- `default_value TEXT` (`Значение по умолчанию`, первая колонка);
+- `values_list TEXT` (`Список`);
+- `computed TEXT` (`Вычисление`);
+- `promotion_level TEXT` (`Уровень продвижения`);
+- `formula TEXT` (`Формула`);
+- `language_variant TEXT` (`Языковой вариант`);
+- `guid TEXT` (`Глобальный идентификатор`);
+- `domain TEXT` (`Предметная область`);
+- `uniqueness TEXT` (`Уникальность`);
+- `operations_optimization TEXT` (`Оптимизация операций`);
+- `affects_content_date TEXT` (`Влияет на дату модификации содержимого объекта`);
+- `options TEXT` (`Опции`);
+- `input_mask TEXT` (`Маска ввода значения`);
+- `master_attribute TEXT` (`Мастер-атрибут`);
+- `data_source TEXT` (`Источник данных`);
+- `mult_default_values TEXT` (`F_MULTDEFAULT_VALUES`);
+- `size_type TEXT` (`Размер/тип`);
+- `source_file TEXT NOT NULL`;
 - `source_modified_at TEXT`.
+
+Вторая колонка `Значение по умолчанию` (поз. 23) задвоена в выгрузке; в схему она не переносится, используется первая (поз. 6).
 
 Индексы: `name`, `alias`, `guid`.
 
 ### relation_types
 
-Поля:
+Поля (источник — `All-links-list.xlsx`, первая колонка `Тип связи`):
 
 - `id INTEGER PRIMARY KEY`;
-- `name TEXT NOT NULL`;
-- `short_name TEXT`;
-- `guid TEXT`;
-- `description TEXT`;
-- `relation_kind TEXT`;
-- `source_file TEXT`;
+- `name TEXT NOT NULL` (`Наименование`);
+- `relation_name TEXT` (`Название связи`);
+- `inverse_relation_name TEXT` (`Обратное название связи`);
+- `comment TEXT` (`Комментарий`);
+- `extract_files TEXT` (`Извлечение файлов объектов`);
+- `relation_kind TEXT` (`Вид связи`);
+- `guid TEXT` (`Глобальный идентификатор`);
+- `domain TEXT` (`Предметная область`);
+- `any_attribute TEXT` (`Возможность присвоения любого атрибута`);
+- `short_name TEXT` (`Краткое наименование`);
+- `options TEXT` (`Опции`);
+- `source_file TEXT NOT NULL`;
 - `source_modified_at TEXT`.
 
 Индексы: `name`, `guid`.
@@ -227,7 +250,15 @@ ID всегда сохранять и в SQLite как INTEGER, и в JSON ка�
 
 ## Атомарная сборка
 
-Генерация должна идти во временный каталог:
+Генератор: `gloss/generate_gloss.py` (Python 3, `openpyxl`, SQLite из стандартной библиотеки).
+
+Запуск:
+
+```bash
+python gloss/generate_gloss.py
+```
+
+Сборка идёт во временный каталог:
 
 ```text
 generated/.build/<timestamp>/
