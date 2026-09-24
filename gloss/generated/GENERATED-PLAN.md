@@ -20,13 +20,7 @@ generated/
 ├─ GENERATE-MANIFEST.json
 ├─ GENERATED-PLAN.md
 ├─ schema.sql
-├─ gloss.db
-├─ object-types.json
-├─ attribute-types.json
-├─ relation-types.json
-├─ object-types.by-id.json
-├─ attribute-types.by-id.json
-└─ relation-types.by-id.json
+└─ gloss.db
 ```
 
 До запуска генератора должны существовать только план, схема и сам генератор. Нельзя создавать пустые `gloss.db` или JSON-файлы, выдавая их за актуальные справочники.
@@ -53,7 +47,7 @@ generated/
 - отсутствие отдельного сервера БД;
 - одинаково удобен для C#, Python и Node.js.
 
-JSON-файлы — производный экспорт для диагностики и небольших lookup-операций. MCP не должен загружать все записи JSON в prompt.
+JSON-экспорты не генерируются: runtime читает только `gloss.db`, отдельные JSON-выгрузки дублируют справочник без применения.
 
 ## Таблицы SQLite
 

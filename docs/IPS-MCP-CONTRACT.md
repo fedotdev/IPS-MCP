@@ -62,10 +62,16 @@ createDate, guid, readOnly.
 4. Убирать внутренние служебные поля, вложенность > 2 уровней — уплощать/пагинировать.
 5. Пагинация list-инструментов: `{items, total, page, page_size, has_more}` (страницы 1-based, page_size 1..1000, default 50).
 
-## Запись (следующий этап, НЕ в read-only MVP)
+## Запись (ограниченный этап)
 
-checkout/edit/setAttributes/saveChanges/checkIn + создания объекта/связи —
-все через preview → одноразовое подтверждение человеком → commit → verify-read.
+При `IPS_ENABLE_WRITE=1` доступны только:
+
+- `ips_prepare_update_attribute(object_id, attribute_id, value)` — читает текущее значение и возвращает preview + `request_id`, записи не выполняет;
+- `ips_commit_update_attribute(request_id)` — повторно проверяет старое значение, выполняет `checkout → edit → attributes → saveChanges → checkIn`, затем verify-read.
+
+`request_id` одноразовый. При ошибке после checkout выполняется `cancelChanges`; write-запросы не повторяются автоматически. Создание объектов, связей, удаление и массовая запись не реализованы.
+
+Обязательное текстовое поле комментария не добавляется: проверенный Swagger IPS Web API 1.0 не содержит параметра комментария у этих endpoint'ов, поэтому нельзя гарантировать запись текста в колонку «Комментарии» журнала IPS.
 
 ## Отличие от устаревшего плана
 

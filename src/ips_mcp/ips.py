@@ -48,7 +48,8 @@ class IpsClient:
             return self._request_locked(method, path, **kw)
 
     def _request_locked(self, method, path, **kw):
-        for attempt in (0, 1):
+        retry = kw.pop("_retry", True)
+        for attempt in range(2):
             headers = dict(kw.pop("headers", {}))
             if self._token:
                 headers["Authorization"] = "Bearer " + self._token
@@ -56,8 +57,7 @@ class IpsClient:
                 resp = self._http.request(method, self._base + path,
                                           headers=headers, **kw)
             except httpx.HTTPError as e:
-                # ponytail: ретрай только сетевых и 5xx, не 4xx; запись не ретраится (в MVP записей нет)
-                if attempt == 0:
+                if attempt == 0 and retry:
                     time.sleep(0.3)
                     continue
                 raise IpsError(0, f"сетевая ошибка: {type(e).__name__}", path)
@@ -67,7 +67,7 @@ class IpsClient:
                 else:
                     self._authenticate()
                 continue
-            if resp.status_code >= 500 and attempt == 0:
+            if resp.status_code >= 500 and attempt == 0 and retry:
                 time.sleep(0.3)
                 continue
             if resp.status_code >= 400:
@@ -194,3 +194,54 @@ def resolve_object_links(client, gloss, attrs, cap=10):
             it["resolvedValues"] = links
         out.append(it)
     return out
+
+
+def snapshot_attr(client, object_id, attribute_id):
+    """Текущее значение атрибута для preview."""
+    for a in client.request("GET", f"/core/api/objects/{object_id}/attributesValues"):
+        if a.get("attributeId") == attribute_id:
+            return a
+    return None
+
+
+def write_attribute(client, object_id, attribute_id, value):
+    """Выполняет checkout → edit → set attributes → saveChanges → checkIn.
+
+    При ошибке после checkout отменяет рабочую копию через cancelChanges.
+    """
+    wc = None
+    checked_in = False
+    try:
+        wc = client.request(
+            "POST", f"/core/api/objects/{object_id}/checkOut", _retry=False,
+            params={"isNeedToLogModificationHistory": True}, json={}).get("result")
+        if not isinstance(wc, int) or wc >= 0:
+            raise IpsError(500, f"checkOut вернул неверный workingCopyId: {wc!r}",
+                           f"/core/api/objects/{object_id}/checkOut")
+        client.request("POST", f"/core/api/objects/{wc}/edit", _retry=False,
+                       params={"isNeedToLogModificationHistory": True}, json={})
+        client.request("POST", f"/core/api/objects/{wc}/attributes", _retry=False,
+                       json=[{"attributeID": attribute_id, "values": [value]}])
+        client.request("POST", f"/core/api/objects/{wc}/saveChanges", _retry=False,
+                       params={"isNeedToLogModificationHistory": True}, json={})
+        version = client.request("POST", f"/core/api/objects/{wc}/checkIn", _retry=False,
+                                 params={"isNeedToLogModificationHistory": True}, json={}).get("result")
+        checked_in = True
+        return {"objectId": object_id, "workingCopyId": wc, "versionId": version}
+    except Exception:
+        if not checked_in and isinstance(wc, int) and wc < 0:
+            try:
+                client.request("POST", "/core/api/objects/cancelChanges", _retry=False,
+                               params={"isNeedToLogModificationHistory": True,
+                                       "isNeedToIgnoreExceptions": True},
+                               json=[wc])
+            except Exception:
+                pass  # исходная ошибка важнее; незавершённый checkout виден в аудите
+        raise
+
+
+def read_attr_value(client, object_id, attribute_id):
+    for a in client.request("GET", f"/core/api/objects/{object_id}/attributesValues"):
+        if a.get("attributeId") == attribute_id:
+            return a.get("values")
+    return None

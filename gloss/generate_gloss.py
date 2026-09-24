@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Генератор базы знаний IPS-MCP из Excel-выгрузок.
 
-Читает All-*-list.xlsx из gloss/, строит SQLite gloss.db и JSON-экспорт
-в generated/ по схеме generated/schema.sql.
+Читает All-*-list.xlsx из gloss/ и строит SQLite gloss.db в generated/
+по схеме generated/schema.sql.
 
 Запуск:  python gloss/generate_gloss.py
 """
@@ -151,14 +151,6 @@ def validate(rows, table, errors):
             errors.append((table, rid, "invalid_guid", f"некорректный GUID {guid!r}"))
 
 
-def build_json(rows):
-    return [{"id": r["id"], "name": r["name"], "guid": r.get("guid")} for r in rows]
-
-
-def build_json_by_id(rows):
-    return {str(r["id"]): {"id": r["id"], "name": r["name"], "guid": r.get("guid")} for r in rows}
-
-
 def main():
     for f, table, _ in FILES:
         src = ROOT / f
@@ -189,8 +181,6 @@ def main():
     schema = (GENERATED / "schema.sql").read_text(encoding="utf-8")
     conn.executescript(schema)
 
-    colnames = {t: [c[0] for c in COLUMNS[t]] + [] for t in COLUMNS}
-
     for f, table, _ in FILES:
         src = ROOT / f
         cols = [c[0] for c in COLUMNS[table]] + ["source_file", "source_modified_at"]
@@ -209,19 +199,6 @@ def main():
 
     generated_at = datetime.now(timezone.utc).isoformat()
     counts = {t: len(data[t]) for t in sorted(data)}
-
-    with open(BUILD / "object-types.json", "w", encoding="utf-8") as fh:
-        json.dump(build_json(data["object_types"]), fh, ensure_ascii=False, indent=2)
-    with open(BUILD / "attribute-types.json", "w", encoding="utf-8") as fh:
-        json.dump(build_json(data["attribute_types"]), fh, ensure_ascii=False, indent=2)
-    with open(BUILD / "relation-types.json", "w", encoding="utf-8") as fh:
-        json.dump(build_json(data["relation_types"]), fh, ensure_ascii=False, indent=2)
-    with open(BUILD / "object-types.by-id.json", "w", encoding="utf-8") as fh:
-        json.dump(build_json_by_id(data["object_types"]), fh, ensure_ascii=False, indent=2)
-    with open(BUILD / "attribute-types.by-id.json", "w", encoding="utf-8") as fh:
-        json.dump(build_json_by_id(data["attribute_types"]), fh, ensure_ascii=False, indent=2)
-    with open(BUILD / "relation-types.by-id.json", "w", encoding="utf-8") as fh:
-        json.dump(build_json_by_id(data["relation_types"]), fh, ensure_ascii=False, indent=2)
 
     manifest = {
         "schemaVersion": 1,
@@ -247,11 +224,7 @@ def main():
     smoke(conn)
     conn.close()
 
-    for p in [
-        "gloss.db", "object-types.json", "attribute-types.json", "relation-types.json",
-        "object-types.by-id.json", "attribute-types.by-id.json", "relation-types.by-id.json",
-        "GENERATE-MANIFEST.json",
-    ]:
+    for p in ["gloss.db", "GENERATE-MANIFEST.json"]:
         shutil.copy2(BUILD / p, GENERATED / p)
 
     print(f"OK: {counts['object_types']} object types, "

@@ -9,6 +9,7 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
+from uuid import uuid4
 
 from . import ips
 
@@ -22,11 +23,20 @@ def _audit_line(path, rec):
         fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
-def _err(resp):
-    try:
-        return resp.json()
-    except Exception:
-        return {"detail": resp.text[:200]}
+class WriteStore:
+    """Хранилище подготовленных операций. Подтверждение разовое (Once):
+    после commit запрос удаляется, повторный вызов невозможен."""
+
+    def __init__(self):
+        self._pending = {}
+
+    def put(self, record):
+        rid = uuid4().hex
+        self._pending[rid] = record
+        return rid
+
+    def take(self, request_id):
+        return self._pending.pop(request_id, None)
 
 
 def build_tools(client, gloss):
@@ -191,11 +201,106 @@ def _composition_tree(client, gloss, args):
             "count": len(out), "items": out}
 
 
+def build_write_tools(client, gloss, store):
+    """Двухфазные write-операции: preview → одноразовое подтверждение → commit.
+
+    Не регистрируются без IPS_ENABLE_WRITE=1.
+    # ponytail: при сбое после checkout рабочая копия не освобождается;
+    # добавить release/checkin после фиксации надёжного отката в IPS Web API
+    """
+
+    def prepare(a):
+        object_id = a["object_id"]
+        attribute_id = a["attribute_id"]
+        cur = ips.snapshot_attr(client, object_id, attribute_id)
+        if cur is None:
+            raise ips.IpsError(404, f"атрибут {attribute_id} не найден",
+                               f"/core/api/objects/{object_id}/attributesValues")
+        old = cur.get("values")
+        new = a.get("value")
+        if old == [new]:
+            raise ips.IpsError(409, "новое значение совпадает с текущим, запись не требуется",
+                               f"/core/api/objects/{object_id}/attributes")
+        rid = store.put({
+            "object_id": object_id,
+            "attribute_id": attribute_id,
+            "value": new,
+            "old_value": old,
+        })
+        return {
+            "request_id": rid,
+            "preview": {
+                "action": "update_attribute",
+                "objectId": object_id,
+                "attribute": {
+                    "id": attribute_id,
+                    "name": cur.get("attributeName"),
+                    "old_value": old,
+                    "new_value": new,
+                },
+                "operations": ["checkOut", "edit", "attributes", "saveChanges", "checkIn"],
+                "note": "Операция НЕ выполнена. Подтверждение разовое: вызовите "
+                        "ips_commit_update_attribute с request_id.",
+            },
+        }
+
+    def commit(a):
+        request_id = a["request_id"]
+        rec = store.take(request_id)
+        if rec is None:
+            raise ips.IpsError(409, "подтверждение отсутствует или уже использовано (once)",
+                               "/write/commit")
+        current = ips.snapshot_attr(client, rec["object_id"], rec["attribute_id"])
+        if current is None or current.get("values") != rec["old_value"]:
+            raise ips.IpsError(409, "значение атрибута изменилось после preview; подготовьте операцию заново",
+                               f"/core/api/objects/{rec['object_id']}/attributesValues")
+        result = ips.write_attribute(client, rec["object_id"],
+                                     rec["attribute_id"], rec["value"])
+        verified = ips.read_attr_value(client, rec["object_id"], rec["attribute_id"])
+        return {
+            "operation": "update_attribute",
+            "status": "ok",
+            **result,
+            "verify": {"attributeId": rec["attribute_id"], "value": verified},
+        }
+
+    def make(spec):
+        def handler(args):
+            return spec["call"](args)
+        return {"name": spec["name"], "description": spec["description"],
+                "inputSchema": spec["schema"], "call": handler}
+
+    return [
+        make({
+            "name": "ips_prepare_update_attribute",
+            "description": "Сформировать preview изменения атрибута объекта IPS. Запись НЕ выполняется, возвращается request_id для подтверждения.",
+            "schema": {"type": "object",
+                       "properties": {"object_id": {"type": "integer"},
+                                      "attribute_id": {"type": "integer"},
+                                      "value": {}},
+                       "required": ["object_id", "attribute_id", "value"]},
+            "call": prepare,
+        }),
+        make({
+            "name": "ips_commit_update_attribute",
+            "description": "ВЫПОЛНИТЬ подтверждённую операцию по request_id: checkout → edit → set attributes → saveChanges → checkIn. Разовый (once).",
+            "schema": {"type": "object",
+                       "properties": {"request_id": {"type": "string"}},
+                       "required": ["request_id"]},
+            "call": commit,
+        }),
+    ]
+
+
 class McpServer:
-    def __init__(self, client, gloss, audit_path=None):
+    def __init__(self, client, gloss, audit_path=None, enable_write=False):
         self._tools = build_tools(client, gloss)
         self._by_name = {t["name"]: t for t in self._tools}
         self._audit_path = audit_path
+        if enable_write:
+            store = WriteStore()
+            self._tools += build_write_tools(client, gloss, store)
+            self._by_name = {t["name"]: t for t in self._tools}
 
     def _result(self, msg_id, result):
         return {"jsonrpc": "2.0", "id": msg_id, "result": result}
@@ -266,13 +371,15 @@ def run():
                               os.path.join(os.path.dirname(__file__),
                                            "..", "..", "gloss", "generated", "gloss.db"))
     audit_path = os.environ.get("IPS_AUDIT_LOG")
+    enable_write = os.environ.get("IPS_ENABLE_WRITE") == "1"
     if not login or not password:
         sys.stderr.write("IPS_LOGIN и IPS_PASSWORD обязательны\n")
         sys.exit(2)
 
     client = ips.IpsClient(base, login, password, role_id=role_id)
     gloss = ips.load_gloss(gloss_db) if os.path.exists(gloss_db) else {}
-    server = McpServer(client, gloss, audit_path=audit_path)
+    server = McpServer(client, gloss, audit_path=audit_path,
+                       enable_write=enable_write)
 
     for line in sys.stdin:
         line = line.strip()

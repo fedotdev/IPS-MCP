@@ -5,6 +5,8 @@ import httpx
 
 sys.path.insert(0, "src")
 
+import json
+
 from ips_mcp import ips
 
 
@@ -129,6 +131,92 @@ def test_resolve_object_links():
     assert "resolvedValues" not in out[1]
     # кап 2 запроса: ссылки атрибута 3 не разворачиваются полностью
     assert len(calls) == 2, calls
+
+
+def test_write_flow_once():
+    from ips_mcp.server import McpServer
+
+    state = {"value": "005 ТЕСТ"}
+
+    def handler(request):
+        path = request.url.path
+        if request.method == "GET" and path.endswith("/attributesValues"):
+            return httpx.Response(200, json=[
+                {"attributeId": 1066, "attributeName": "Номер объекта",
+                 "values": [state["value"]]}])
+        if path.endswith("/attributes") and request.method == "POST":
+            state["value"] = "006 НОВОЕ"
+            return httpx.Response(200, json={"result": {}})
+        if path.endswith("/checkOut"):
+            return httpx.Response(200, json={"result": -111})
+        if path.endswith("/checkIn"):
+            return httpx.Response(200, json={"result": -111})
+        return httpx.Response(200, json={"result": {}})
+
+    c = ips.IpsClient("http://x", "u", "p")
+    c._token = "t"
+    c._http = handler_with(handler)
+    server = McpServer(c, {}, enable_write=True)
+    names = [t["name"] for t in server.handle(
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list",
+         "params": {}})["result"]["tools"]]
+    assert "ips_prepare_update_attribute" in names
+    assert "ips_commit_update_attribute" in names
+
+    prep = server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                          "params": {"name": "ips_prepare_update_attribute",
+                                     "arguments": {"object_id": 1349039,
+                                                   "attribute_id": 1066,
+                                                   "value": "006 НОВОЕ"}}})
+    body = json.loads(prep["result"]["content"][0]["text"])
+    rid = body["request_id"]
+    assert body["preview"]["attribute"]["old_value"] == ["005 ТЕСТ"]
+    assert body["preview"]["operations"] == ["checkOut", "edit", "attributes",
+                                             "saveChanges", "checkIn"]
+
+    com = server.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                         "params": {"name": "ips_commit_update_attribute",
+                                    "arguments": {"request_id": rid}}})
+    out = json.loads(com["result"]["content"][0]["text"])
+    assert out["status"] == "ok"
+    assert out["verify"]["value"] == ["006 НОВОЕ"]
+    assert out["workingCopyId"] == -111
+
+    # once: повторный commit тем же request_id невозможен
+    again = server.handle({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                           "params": {"name": "ips_commit_update_attribute",
+                                      "arguments": {"request_id": rid}}})
+    assert "once" in again["result"]["content"][0]["text"]
+
+
+def test_write_failure_rolls_back_checkout():
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.path)
+        if request.url.path.endswith("/checkOut"):
+            return httpx.Response(200, json={"result": -111})
+        if request.url.path.endswith("/attributes"):
+            return httpx.Response(400, json={"detail": "invalid value"})
+        if request.url.path.endswith("/cancelChanges"):
+            return httpx.Response(200, json={"result": [-111]})
+        return httpx.Response(200, json={"result": {}})
+
+    c = ips.IpsClient("http://x", "u", "p")
+    c._token = "t"
+    c._http = handler_with(handler)
+    try:
+        ips.write_attribute(c, 1349039, 1066, "bad")
+    except ips.IpsError as e:
+        assert e.status == 400
+    else:
+        raise AssertionError("ожидали ошибку записи")
+    assert calls == [
+        "/core/api/objects/1349039/checkOut",
+        "/core/api/objects/-111/edit",
+        "/core/api/objects/-111/attributes",
+        "/core/api/objects/cancelChanges",
+    ], calls
 
 
 if __name__ == "__main__":
