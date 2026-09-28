@@ -16,3 +16,4 @@ gloss/generated/GENERATE-MANIFEST.json
 
 # Секреты
 .env
+config.json

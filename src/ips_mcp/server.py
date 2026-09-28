@@ -15,6 +15,21 @@ from . import ips
 
 KNOWN_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 
+# Корень проекта: src/ips_mcp/server.py -> src/ips_mcp -> src -> <root>.
+# Считаемся от файла, а не от cwd: конфиг и справочник должны находиться
+# при запуске из любого каталога (opencode, CI, IDE).
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+DEFAULTS = {
+    "IPS_BASE_URL": "http://192.168.80.70:8080",
+    "IPS_ROLE_ID": 0,
+    "IPS_GLOSS_DB": "gloss/generated/gloss.db",
+    "IPS_AUDIT_LOG": "",
+    "IPS_ENABLE_WRITE": False,
+}
+
+PATH_FIELDS = ("IPS_GLOSS_DB", "IPS_AUDIT_LOG")
+
 
 def _audit_line(path, rec):
     if not path:
@@ -366,31 +381,51 @@ CONFIG_ENV_KEYS = ("IPS_LOGIN", "IPS_PASSWORD", "IPS_BASE_URL", "IPS_ROLE_ID",
                    "IPS_GLOSS_DB", "IPS_AUDIT_LOG", "IPS_ENABLE_WRITE")
 
 
-def load_config(path):
-    """Загружает config.json, заполняя окружение. Приоритет: явные env > файл."""
+def default_config_path():
+    return os.environ.get("IPS_CONFIG") or os.path.join(PROJECT_ROOT, "config.json")
+
+
+def read_config(path):
+    """Читает config.json. Возвращает {} если файла нет, None если он битый."""
     if not path or not os.path.exists(path):
-        return
+        return {}
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
     except (OSError, ValueError) as e:
         sys.stderr.write(f"IPS-MCP: предупреждение: не удалось прочитать {path}: {e}\n")
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def load_config(path):
+    """Загружает config.json, заполняя окружение. Приоритет: явные env > файл.
+
+    Относительные IPS_GLOSS_DB / IPS_AUDIT_LOG разрешаются от каталога конфига,
+    иначе файл, скопированный из другого проекта, молча указывал бы в никуда.
+    """
+    data = read_config(path)
+    if data is None:
         return
+    base = os.path.dirname(os.path.abspath(path)) if path else PROJECT_ROOT
     for key in CONFIG_ENV_KEYS:
         value = data.get(key)
-        if value is not None and not os.environ.get(key):
-            os.environ[key] = str(value)
+        if value is None or os.environ.get(key):
+            continue
+        value = str(value)
+        if key in PATH_FIELDS and value and not os.path.isabs(value):
+            value = os.path.normpath(os.path.join(base, value))
+        os.environ[key] = value
 
 
 def run():
-    load_config(os.environ.get("IPS_CONFIG", "config.json"))
-    base = os.environ.get("IPS_BASE_URL", "http://192.168.80.70:8080")
+    load_config(default_config_path())
+    base = os.environ.get("IPS_BASE_URL", DEFAULTS["IPS_BASE_URL"])
     login = os.environ.get("IPS_LOGIN")
     password = os.environ.get("IPS_PASSWORD")
-    role_id = int(os.environ.get("IPS_ROLE_ID", "0"))
+    role_id = int(os.environ.get("IPS_ROLE_ID", DEFAULTS["IPS_ROLE_ID"]))
     gloss_db = os.environ.get("IPS_GLOSS_DB",
-                              os.path.join(os.path.dirname(__file__),
-                                           "..", "..", "gloss", "generated", "gloss.db"))
+                              os.path.join(PROJECT_ROOT, *DEFAULTS["IPS_GLOSS_DB"].split("/")))
     audit_path = os.environ.get("IPS_AUDIT_LOG")
     enable_write = os.environ.get("IPS_ENABLE_WRITE", "").strip().lower() in {"1", "true", "yes", "on"}
     if not login or not password:
@@ -428,5 +463,93 @@ def run():
             sys.stdout.flush()
 
 
-if __name__ == "__main__":
+def _ask(prompt, secret=False):
+    """Вопрос пользователю. None — stdin не интерактивен (pipe, CI, перенаправление)."""
+    import getpass
+    try:
+        if secret:
+            return getpass.getpass(f"{prompt}: ") or None
+        return input(f"{prompt}: ").strip() or None
+    except (EOFError, OSError):
+        return None
+
+
+def init_config(argv=None):
+    """Создаёт/дополняет config.json. Значения берутся из env, иначе — с терминала.
+
+    Не перезаписывает существующий config.json без --force: в нём пароль.
+    """
+    import argparse
+    ap = argparse.ArgumentParser(prog="ips-mcp init", add_help=True)
+    ap.add_argument("--config", default=None, help="путь к config.json")
+    ap.add_argument("--force", action="store_true", help="перезаписать существующий")
+    args = ap.parse_args(argv)
+
+    path = args.config or default_config_path()
+    existing = read_config(path)
+    if existing is None:
+        sys.stderr.write(f"IPS-MCP: {path} не является JSON-объектом, исправьте или удалите\n")
+        return 2
+    if existing and not args.force:
+        sys.stderr.write(
+            f"IPS-MCP: {path} уже существует.\n"
+            "  Перезаписать:  ips-mcp init --force\n"
+            "  Дописать недостающие поля можно вручную — сервер берёт их из env.\n")
+        return 1
+
+    cfg = {
+        "IPS_LOGIN": os.environ.get("IPS_LOGIN", ""),
+        "IPS_PASSWORD": os.environ.get("IPS_PASSWORD", ""),
+        "IPS_BASE_URL": os.environ.get("IPS_BASE_URL", DEFAULTS["IPS_BASE_URL"]),
+        "IPS_ROLE_ID": int(os.environ.get("IPS_ROLE_ID", DEFAULTS["IPS_ROLE_ID"])),
+        "IPS_GLOSS_DB": os.environ.get("IPS_GLOSS_DB", DEFAULTS["IPS_GLOSS_DB"]),
+        "IPS_AUDIT_LOG": os.environ.get("IPS_AUDIT_LOG", DEFAULTS["IPS_AUDIT_LOG"]),
+        "IPS_ENABLE_WRITE": os.environ.get("IPS_ENABLE_WRITE", "").lower() in {"1", "true", "yes", "on"},
+    }
+
+    for key, secret in (("IPS_LOGIN", False), ("IPS_PASSWORD", True)):
+        if cfg[key]:
+            continue
+        value = _ask(key, secret=secret)
+        if value:
+            cfg[key] = value
+        else:
+            missing = "IPS_LOGIN" if key == "IPS_LOGIN" else "IPS_PASSWORD"
+            sys.stderr.write(
+                f"IPS-MCP: не задан {missing}.\n"
+                "Задайте его в окружении либо запустите init в интерактивном терминале:\n"
+                f'  setx {missing} "..."\n'
+                "setx действует только на НОВЫЕ процессы — перезапустите терминал.\n")
+            return 2
+
+    try:
+        int(cfg["IPS_ROLE_ID"])
+    except (TypeError, ValueError):
+        sys.stderr.write(f"IPS-MCP: IPS_ROLE_ID должен быть числом, получено {cfg['IPS_ROLE_ID']!r}\n")
+        return 2
+
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(cfg, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+
+    gloss = cfg["IPS_GLOSS_DB"]
+    if gloss and not os.path.isabs(gloss):
+        gloss = os.path.join(os.path.dirname(os.path.abspath(path)), gloss)
+    note = "" if gloss and os.path.exists(gloss) else "  (справочник не найден — сервер стартует без имён)"
+    sys.stderr.write(
+        f"IPS-MCP: записан {path}\n"
+        f"  роль {cfg['IPS_ROLE_ID']}, {cfg['IPS_BASE_URL']}{note}\n"
+        "  Файл в .gitignore. Далее: ips-mcp  или подключите в opencode.json "
+        "(type=local, command=[\"python\",\"-m\",\"ips_mcp.server\"]).\n")
+    return 0
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "init":
+        return init_config(sys.argv[2:])
     run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

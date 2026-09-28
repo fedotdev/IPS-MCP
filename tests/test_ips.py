@@ -1,3 +1,4 @@
+import os
 import sys
 import threading
 
@@ -217,6 +218,98 @@ def test_write_failure_rolls_back_checkout():
         "/core/api/objects/-111/attributes",
         "/core/api/objects/cancelChanges",
     ], calls
+
+
+def test_config_file_loading(tmpdir_factory=None):
+    import tempfile
+    from ips_mcp.server import load_config
+
+    with tempfile.TemporaryDirectory() as d:
+        cfg = os.path.join(d, "config.json")
+        with open(cfg, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"IPS_LOGIN": "file_user",
+                                 "IPS_PASSWORD": "file_pass",
+                                 "IPS_ROLE_ID": 5,
+                                 "IPS_ENABLE_WRITE": True}))
+        old = {k: os.environ.get(k) for k in ("IPS_LOGIN", "IPS_PASSWORD",
+                                               "IPS_ROLE_ID", "IPS_ENABLE_WRITE")}
+        try:
+            for k in old:
+                os.environ.pop(k, None)
+            load_config(cfg)
+            assert os.environ["IPS_LOGIN"] == "file_user"
+            assert os.environ["IPS_ROLE_ID"] == "5"
+            # загрузка часов: env игнорирует файл
+            os.environ["IPS_LOGIN"] = "env_user"
+            load_config(cfg)
+            assert os.environ["IPS_LOGIN"] == "env_user"
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
+def test_relative_gloss_resolves_from_config_dir():
+    """Относительный IPS_GLOSS_DB разрешается от каталога config.json, а не cwd.
+
+    Иначе конфиг, скопированный из другого проекта, молча указывал бы в никуда.
+    """
+    import tempfile
+    from ips_mcp.server import load_config
+
+    with tempfile.TemporaryDirectory() as d:
+        cfg = os.path.join(d, "config.json")
+        with open(cfg, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"IPS_LOGIN": "u", "IPS_PASSWORD": "p",
+                                 "IPS_GLOSS_DB": "gloss/generated/gloss.db"}))
+        old = os.environ.pop("IPS_GLOSS_DB", None)
+        try:
+            load_config(cfg)
+            expected = os.path.normpath(os.path.join(d, "gloss", "generated", "gloss.db"))
+            assert os.environ["IPS_GLOSS_DB"] == expected, os.environ["IPS_GLOSS_DB"]
+        finally:
+            if old is None:
+                os.environ.pop("IPS_GLOSS_DB", None)
+            else:
+                os.environ["IPS_GLOSS_DB"] = old
+
+
+def test_init_writes_config_and_never_clobbers():
+    """init пишет config.json из env и отказывается перезаписывать существующий."""
+    import tempfile
+    from ips_mcp.server import init_config
+
+    keys = ("IPS_LOGIN", "IPS_PASSWORD", "IPS_BASE_URL", "IPS_ROLE_ID",
+            "IPS_GLOSS_DB", "IPS_AUDIT_LOG", "IPS_ENABLE_WRITE")
+    old = {k: os.environ.get(k) for k in keys}
+    with tempfile.TemporaryDirectory() as d:
+        cfg = os.path.join(d, "config.json")
+        try:
+            for k in keys:
+                os.environ.pop(k, None)
+            os.environ["IPS_LOGIN"] = "init_user"
+            os.environ["IPS_PASSWORD"] = "init_pass"
+            os.environ["IPS_ROLE_ID"] = "42"
+            assert init_config(["--config", cfg]) == 0
+            with open(cfg, encoding="utf-8") as fh:
+                data = json.load(fh)
+            assert data["IPS_LOGIN"] == "init_user"
+            assert data["IPS_ROLE_ID"] == 42, data["IPS_ROLE_ID"]
+            assert data["IPS_ENABLE_WRITE"] is False
+
+            # повторный init без --force обязан отказаться и не тронуть файл
+            os.environ["IPS_LOGIN"] = "other"
+            assert init_config(["--config", cfg]) == 1
+            with open(cfg, encoding="utf-8") as fh:
+                assert json.load(fh)["IPS_LOGIN"] == "init_user"
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
 
 if __name__ == "__main__":

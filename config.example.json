@@ -1,0 +1,10 @@
+{
+  "_comment": "Скопируйте в config.json и заполните значения. Одноимённые переменные окружения имеют приоритет над этим файлом.",
+  "IPS_LOGIN": "user_name",
+  "IPS_PASSWORD": "user_password",
+  "IPS_BASE_URL": "http://192.168.80.70:8080",
+  "IPS_ROLE_ID": 0,
+  "IPS_GLOSS_DB": "gloss/generated/gloss.db",
+  "IPS_AUDIT_LOG": "",
+  "IPS_ENABLE_WRITE": false
+}

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "ips": {
+      "type": "local",
+      "command": ["python", "-m", "ips_mcp.server"],
+      "environment": {
+        "PYTHONPATH": "src",
+        "IPS_BASE_URL": "http://192.168.80.70:8080",
+        "IPS_ROLE_ID": "782041",
+        "IPS_GLOSS_DB": "gloss/generated/gloss.db",
+        "IPS_AUDIT_LOG": "C:\\Users\\fedor\\AppData\\Local\\Temp\\opencode\\ips-mcp-audit.jsonl"
+      }
+    }
+  }
+}
