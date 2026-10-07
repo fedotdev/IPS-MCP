@@ -220,6 +220,635 @@ def test_write_failure_rolls_back_checkout():
     ], calls
 
 
+def test_search_serialization_and_validation():
+    seen = []
+
+    def handler(request):
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json=[])
+
+    from ips_mcp.server import McpServer
+    c = ips.IpsClient("http://x", "u", "p")
+    c._token = "t"
+    c._http = handler_with(handler)
+    server = McpServer(c, {})
+    tool = server._by_name["ips_search_objects"]["call"]
+    tool({"object_type_id": 7, "attribute_ids_to_select": [10],
+          "condition": {"attribute_id": 10, "value": "abc"}, "record_count": 1000})
+    assert seen == [{"objectTypeId": 7, "attributeIdsToSelect": [10],
+                     "recordCount": 1000,
+                     "conditions": [{"attributeId": 10, "relationalOperator": "equal", "value": "abc"}]}]
+    try:
+        tool({"object_type_id": -1})
+    except ips.IpsError:
+        pass
+    else:
+        raise AssertionError("all-types search must be rejected")
+    try:
+        tool({"object_type_id": 7, "record_count": 5000})
+    except ips.IpsError:
+        pass
+    else:
+        raise AssertionError("record_count cap must be rejected")
+    for key, value in (("object_type_id", True), ("object_type_id", "7"),
+                       ("object_type_id", 1.5), ("record_count", True),
+                       ("record_count", "10"), ("record_count", 1.5),
+                       ("attribute_ids_to_select", [True]),
+                       ("attribute_ids_to_select", ["10"]),
+                       ("attribute_ids_to_select", [1.5])):
+        args = {"object_type_id": 7}
+        args[key] = value
+        try:
+            tool(args)
+        except ips.IpsError:
+            pass
+        else:
+            raise AssertionError(f"invalid search value accepted: {key}={value!r}")
+
+
+def test_create_and_relation_two_phase_once_without_delete():
+    calls = []
+
+    def handler(request):
+        calls.append((request.method, request.url.path, json.loads(request.content or b"{}")))
+        if request.url.path == "/core/api/objects":
+            return httpx.Response(200, json={"entity": {"objectID": 42}})
+        if request.url.path.endswith("/commitCreation"):
+            return httpx.Response(200, json={"result": {"objectId": 42, "relatedObjectIds": []}})
+        return httpx.Response(200, json={"result": {}})
+
+    from ips_mcp.server import McpServer
+    c = ips.IpsClient("http://x", "u", "p")
+    c._token = "t"
+    c._http = handler_with(handler)
+    server = McpServer(c, {}, enable_write=True)
+    prep = server._by_name["ips_prepare_create_object"]["call"]({"object_type_id": 7})
+    assert calls == []
+    out = server._by_name["ips_commit_create_object"]["call"]({"request_id": prep["request_id"]})
+    assert out["status"] == "ok"
+    assert [x[1] for x in calls] == ["/core/api/objects", "/core/api/objects/42/commitCreation"]
+    try:
+        server._by_name["ips_commit_create_object"]["call"]({"request_id": prep["request_id"]})
+    except ips.IpsError:
+        pass
+    else:
+        raise AssertionError("create confirmation must be once")
+    before = len(calls)
+    try:
+        server._by_name["ips_prepare_create_relation"]["call"]({"relation_type_id": 1, "project_version_id": 2, "part_version_id": 3})
+    except ips.IpsError:
+        pass
+    else:
+        raise AssertionError("relation without an active parent checkout must be rejected")
+    assert len(calls) == before
+    assert all(x[0] != "DELETE" for x in calls)
+
+
+def test_create_object_ids_and_error_stages():
+    from ips_mcp.server import McpServer
+
+    def server_for(handler):
+        c = ips.IpsClient("http://x", "u", "p")
+        c._token = "t"
+        c._http = handler_with(handler)
+        return McpServer(c, {}, enable_write=True)
+
+    captured = []
+    def integer_response(request):
+        captured.append((request.url.path, json.loads(request.content or b"{}")))
+        if request.url.path == "/core/api/objects":
+            return httpx.Response(200, json={"entity": {"objectID": 0}})
+        return httpx.Response(200, json={"result": {"objectId": 0}})
+    server = server_for(integer_response)
+    prep = server._by_name["ips_prepare_create_object"]["call"]({"object_type_id": 0, "attributes": [{"attributeID": 4, "values": ["x"]}]})
+    assert prep["preview"]["payload"] == {"objectType": 0, "attributes": [{"attributeID": 4, "values": ["x"]}]}
+    out = server._by_name["ips_commit_create_object"]["call"]({"request_id": prep["request_id"]})
+    assert out["status"] == "ok" and out["object_id"] == 0
+    assert captured[1][0] == "/core/api/objects/0/commitCreation"
+
+    for response, expected in ((httpx.Response(500), "unknown"),):
+        def failed(request, response=response):
+            return response
+        server = server_for(failed)
+        prep = server._by_name["ips_prepare_create_object"]["call"]({"object_type_id": 1})
+        out = server._by_name["ips_commit_create_object"]["call"]({"request_id": prep["request_id"]})
+        assert out["status"] == expected and out["stage"] == "create"
+
+    def create_then_fail_commit(request):
+        if request.url.path == "/core/api/objects":
+            return httpx.Response(200, json={"entity": {"objectID": 5}})
+        return httpx.Response(500)
+    server = server_for(create_then_fail_commit)
+    prep = server._by_name["ips_prepare_create_object"]["call"]({"object_type_id": 1})
+    out = server._by_name["ips_commit_create_object"]["call"]({"request_id": prep["request_id"]})
+    assert out["status"] == "partial_unknown" and out["stage"] == "commitCreation"
+
+
+def test_create_by_prototype_preserves_related_working_copy_ids_once():
+    from ips_mcp.server import McpServer
+    calls = []
+
+    def handler(request):
+        calls.append((request.method, request.url.path,
+                      json.loads(request.content or b"{}")))
+        if request.method == "GET":
+            return httpx.Response(200, json={"entity": {
+                "objectID": 100, "objectGUID": "prototype-guid",
+                "caption": "030 Prototype"}})
+        if request.url.path.endswith("CreateByPrototype"):
+            return httpx.Response(200, json={"result": {
+                "objectDto": {"objectID": -200}, "relatedObjectIds": [-201]}})
+        if request.url.path.endswith("commitCreation"):
+            return httpx.Response(200, json={"result": {
+                "objectId": 200, "relatedObjectIds": [201]}})
+        raise AssertionError(request.url.path)
+
+    c = ips.IpsClient("http://x", "u", "p")
+    c._token = "t"
+    c._http = handler_with(handler)
+    server = McpServer(c, {}, enable_write=True)
+    prepare = server._by_name["ips_prepare_create_by_prototype"]["call"]
+    commit = server._by_name["ips_commit_create_by_prototype"]["call"]
+    preview = prepare({"prototype_id": 100})
+    assert preview["preview"]["prototype"] == "030 Prototype"
+    assert len(calls) == 1  # preview только читает прототип
+    result = commit({"request_id": preview["request_id"]})
+    assert result["status"] == "ok" and result["object_id"] == 200
+    assert calls[2] == ("POST", "/core/api/objects/CreateByPrototype",
+                        {"prototypeId": 100})
+    assert calls[3] == ("POST", "/core/api/objects/-200/commitCreation",
+                        {"deleteOnException": False, "autoCheckout": False,
+                         "relatedObjectIds": [-201]})
+    before = len(calls)
+    try:
+        commit({"request_id": preview["request_id"]})
+    except ips.IpsError:
+        pass
+    else:
+        raise AssertionError("prototype creation confirmation must be once")
+    assert len(calls) == before
+
+
+def test_relation_transport_failure_is_partial_unknown_and_once():
+    calls = []
+    base = {"objectID": 2, "objectGUID": "g", "objectType": 7,
+            "caption": "parent", "checkoutBy": 0}
+    working = {**base, "objectID": -2, "checkoutBy": 1}
+    active = {"checked_out": False}
+
+    def handler(request):
+        calls.append(request.url.path)
+        if request.method == "GET" and request.url.path.endswith("/currentUsers/userInfo"):
+            return httpx.Response(200, json={"userVersionId": 1})
+        if request.method == "GET":
+            obj = working if request.url.path.endswith("/-2") and active["checked_out"] else base
+            return httpx.Response(200, json={"entity": obj})
+        if request.url.path.endswith("/checkOut"):
+            active["checked_out"] = True
+            return httpx.Response(200, json={"result": -2})
+        if request.url.path == "/core/api/relations":
+            return httpx.Response(500, text="server error")
+        return httpx.Response(200, json={"result": {}})
+
+    from ips_mcp.server import McpServer
+    c = ips.IpsClient("http://x", "u", "p")
+    c._token = "t"
+    c._http = handler_with(handler)
+    server = McpServer(c, {}, enable_write=True)
+    checkout = server._by_name["ips_prepare_checkout_object"]["call"]({"object_id": 2})
+    server._by_name["ips_commit_checkout_object"]["call"]({"request_id": checkout["request_id"]})
+    prep = server._by_name["ips_prepare_create_relation"]["call"]({
+        "relation_type_id": 1, "project_version_id": -2, "part_version_id": 3})
+    out = server._by_name["ips_commit_create_relation"]["call"]({"request_id": prep["request_id"]})
+    assert out["status"] == "partial_unknown"
+    assert calls.count("/core/api/relations") == 1
+    try:
+        server._by_name["ips_commit_create_relation"]["call"]({"request_id": prep["request_id"]})
+    except ips.IpsError:
+        pass
+    else:
+        raise AssertionError("partial relation confirmation must be once")
+
+
+def test_nested_write_attributes_rejected_before_request_id():
+    from ips_mcp.server import McpServer
+    c = ips.IpsClient("http://x", "u", "p")
+    server = McpServer(c, {}, enable_write=True)
+    for name, args in (
+        ("ips_prepare_create_object", {"object_type_id": 7, "attributes": [{"attributeID": True, "values": []}]}),
+        ("ips_prepare_create_object", {"object_type_id": 7, "attributes": [{"attributeID": 1, "values": [], "extra": 1}]}),
+        ("ips_prepare_create_relation", {"relation_type_id": 1, "project_version_id": 2, "part_version_id": 3, "attribute_values": [{"attributeID": "1", "values": []}]}),
+    ):
+        try:
+            server._by_name[name]["call"](args)
+        except ips.IpsError:
+            pass
+        else:
+            raise AssertionError("malformed nested DTO accepted")
+    try:
+        server._by_name["ips_commit_create_object"]["call"]({"request_id": "missing"})
+    except ips.IpsError:
+        pass
+    else:
+        raise AssertionError("malformed prepare must not create a request")
+
+
+def test_create_context_and_relation_payload_match_swagger():
+    from ips_mcp.server import McpServer
+    def handler(request):
+        if request.url.path.endswith("/currentUsers/userInfo"):
+            return httpx.Response(200, json={"userVersionId": 1})
+        if request.method == "GET":
+            if request.url.path.endswith("/-12"):
+                return httpx.Response(200, json={"entity": {"objectID": -12, "objectGUID": "g",
+                    "objectType": 7, "caption": "parent", "checkoutBy": 1}})
+            return httpx.Response(200, json={"entity": {"objectID": 12, "objectGUID": "g",
+                "objectType": 7, "caption": "parent", "checkoutBy": 0}})
+        if request.url.path.endswith("/checkOut"):
+            return httpx.Response(200, json={"result": -12})
+        return httpx.Response(200, json={"result": {}})
+    c = ips.IpsClient("http://x", "u", "p")
+    c._token = "t"
+    c._http = handler_with(handler)
+    server = McpServer(c, {}, enable_write=True)
+    prep = server._by_name["ips_prepare_create_object"]["call"]({
+        "object_type_id": 7, "context_rule": {"editingContextMode": "autoUpdate"},
+        "current_project": {"id": 9, "mode": "currentProject"}})
+    assert prep["preview"]["payload"]["contextRule"] == {"editingContextMode": "autoUpdate"}
+    assert prep["preview"]["payload"]["currentProjectDto"] == {"id": 9, "mode": "currentProject"}
+    checkout = server._by_name["ips_prepare_checkout_object"]["call"]({"object_id": 12})
+    server._by_name["ips_commit_checkout_object"]["call"]({"request_id": checkout["request_id"]})
+    rel = server._by_name["ips_prepare_create_relation"]["call"]({
+        "relation_type_id": 1, "project_version_id": -12, "part_version_id": 3,
+        "attribute_values": [{"attributeID": 8, "values": [4]}]})
+    assert rel["preview"]["payload"]["attributeValues"] == [{"attributeId": 8, "values": [4]}]
+    for args in ({"context_rule": {"unknown": 1}}, {"current_project": {"mode": "bad"}}):
+        args["object_type_id"] = 7
+        try:
+            server._by_name["ips_prepare_create_object"]["call"](args)
+        except ips.IpsError:
+            pass
+        else:
+            raise AssertionError("invalid nested context accepted")
+
+
+def test_write_tools_absent_without_flag():
+    from ips_mcp.server import McpServer
+    c = ips.IpsClient("http://x", "u", "p")
+    server = McpServer(c, {})
+    assert not any("create_" in name or "update_" in name or "delete_" in name for name in server._by_name)
+
+
+def test_checkout_lifecycle_once_without_retries():
+    from ips_mcp.server import McpServer
+    calls = []
+    identity = {"objectID": 12, "objectGUID": "guid", "objectType": 7,
+                "caption": "part", "checkoutBy": 0}
+    working = {**identity, "objectID": -12, "checkoutBy": 1}
+    state = {"checked_out": False}
+
+    def handler(request):
+        calls.append((request.method, request.url.path, json.loads(request.content or b"{}")))
+        if request.method == "GET" and request.url.path.endswith("/currentUsers/userInfo"):
+            return httpx.Response(200, json={"userVersionId": 1})
+        if request.method == "GET":
+            obj = dict(working if request.url.path.endswith("/-12") and state["checked_out"] else identity)
+            if request.url.path.endswith("/-12") and state["checked_out"]:
+                obj["checkoutBy"] = 1
+            return httpx.Response(200, json={"entity": obj})
+        if request.url.path.endswith("/checkOut"):
+            state["checked_out"] = True
+            return httpx.Response(200, json={"result": -12})
+        if request.url.path.endswith("/checkIn"):
+            state["checked_out"] = False
+            return httpx.Response(200, json={"result": -12})
+        if request.url.path.endswith("/cancelChanges"):
+            state["checked_out"] = False
+        return httpx.Response(200, json={"result": {}})
+
+    c = ips.IpsClient("http://x", "u", "p")
+    c._token = "t"
+    c._http = handler_with(handler)
+    server = McpServer(c, {}, enable_write=True)
+    readonly = McpServer(c, {})
+    assert "ips_prepare_checkout_object" not in readonly._by_name
+    prep = server._by_name["ips_prepare_checkout_object"]["call"]({"object_id": 12})
+    assert len(calls) == 1
+    checked = server._by_name["ips_commit_checkout_object"]["call"]({"request_id": prep["request_id"]})
+    assert checked["workingCopyId"] == -12 and checked["result"] == {"result": -12}
+    assert ("POST", "/core/api/objects/12/checkOut", {}) in calls
+    try:
+        server._by_name["ips_commit_checkout_object"]["call"]({"request_id": prep["request_id"]})
+    except ips.IpsError:
+        pass
+    else:
+        raise AssertionError("checkout request reused")
+
+    prep = server._by_name["ips_prepare_finish_checkout"]["call"]({"working_copy_id": -12, "action": "checkin"})
+    start = len(calls)
+    done = server._by_name["ips_commit_finish_checkout"]["call"]({"request_id": prep["request_id"]})
+    assert done["status"] == "ok"
+    assert [x[1] for x in calls[start:start + 4]] == [
+        "/core/api/objects/-12", "/core/api/objects/-12/saveChanges",
+        "/core/api/objects/-12", "/core/api/objects/-12/checkIn"]
+    before_retry = len(calls)
+    try:
+        server._by_name["ips_commit_finish_checkout"]["call"]({"request_id": prep["request_id"]})
+    except ips.IpsError:
+        pass
+    else:
+        raise AssertionError("finish request reused")
+    assert len(calls) == before_retry
+
+    checkout_again = server._by_name["ips_prepare_checkout_object"]["call"]({"object_id": 12})
+    server._by_name["ips_commit_checkout_object"]["call"]({"request_id": checkout_again["request_id"]})
+    prep = server._by_name["ips_prepare_finish_checkout"]["call"]({"working_copy_id": -12, "action": "cancel"})
+    server._by_name["ips_commit_finish_checkout"]["call"]({"request_id": prep["request_id"]})
+    assert ("POST", "/core/api/objects/cancelChanges", [-12]) in calls
+
+
+def test_checkout_fail_closed_and_finish_untracked():
+    from ips_mcp.server import McpServer
+    current = {"objectID": 9, "objectGUID": "g", "objectType": 3,
+               "caption": "x", "checkoutBy": 0}
+
+    def handler(request):
+        if request.method == "GET":
+            return httpx.Response(200, json={"entity": dict(current)})
+        return httpx.Response(200, json={"result": -9})
+
+    c = ips.IpsClient("http://x", "u", "p")
+    c._token = "t"
+    c._http = handler_with(handler)
+    server = McpServer(c, {}, enable_write=True)
+    prep_finish = server._by_name["ips_prepare_finish_checkout"]["call"]
+    try:
+        prep_finish({"working_copy_id": 999, "action": "checkin"})
+    except ips.IpsError:
+        pass
+    else:
+        raise AssertionError("untracked working copy accepted")
+    for malformed in ({**current, "objectGUID": ""}, {k: v for k, v in current.items() if k != "objectGUID"},
+                      {**current, "objectType": True}, {k: v for k, v in current.items() if k != "checkoutBy"}):
+        c._http = handler_with(lambda request, obj=malformed:
+                               httpx.Response(200, json={"entity": obj}))
+        try:
+            server._by_name["ips_prepare_checkout_object"]["call"]({"object_id": 9})
+        except ips.IpsError:
+            pass
+        else:
+            raise AssertionError("malformed checkout identity accepted")
+    c._http = handler_with(handler)
+    prep = server._by_name["ips_prepare_checkout_object"]["call"]({"object_id": 9})
+    current["objectGUID"] = "stale"
+    out = server._by_name["ips_commit_checkout_object"]["call"]({"request_id": prep["request_id"]})
+    assert out["status"] == "pre_send_rejected"
+
+
+def test_checkout_register_existing_negative_working_copy_without_mutation():
+    from ips_mcp.server import McpServer
+    calls = []
+    base = {"objectID": 12, "objectGUID": "g", "objectType": 3,
+            "caption": "part", "checkoutBy": 1, "readOnly": True}
+    working = {**base, "objectID": -12, "readOnly": False}
+
+    def handler(request):
+        calls.append((request.method, request.url.path))
+        if request.url.path.endswith("/currentUsers/userInfo"):
+            return httpx.Response(200, json={"userVersionId": 1})
+        obj = working if request.url.path.endswith("/-12") else base
+        return httpx.Response(200, json={"entity": obj})
+
+    c = ips.IpsClient("http://x", "u", "p")
+    c._token = "t"
+    c._http = handler_with(handler)
+    server = McpServer(c, {}, enable_write=True)
+    prep = server._by_name["ips_prepare_checkout_object"]["call"]({"object_id": -12})
+    assert not any(method == "POST" and path.endswith("/checkOut") for method, path in calls)
+    result = server._by_name["ips_commit_checkout_object"]["call"]({"request_id": prep["request_id"]})
+    assert result["status"] == "ok" and result["workingCopyId"] == -12
+    assert not any(method == "POST" and path.endswith("/checkOut") for method, path in calls)
+
+
+def test_finish_revalidates_after_save_before_checkin():
+    from ips_mcp.server import McpServer
+    calls = []
+    reads = 0
+    obj = {"objectID": 12, "objectGUID": "g", "objectType": 7,
+           "caption": "part", "checkoutBy": 0}
+
+    def handler(request):
+        nonlocal reads
+        calls.append(request.url.path)
+        if request.method == "GET" and request.url.path.endswith("/currentUsers/userInfo"):
+            return httpx.Response(200, json={"userVersionId": 1})
+        if request.method == "GET":
+            reads += 1
+            out = dict(obj)
+            if request.url.path.endswith("/-12"):
+                out["objectID"] = -12
+                out["checkoutBy"] = 1
+                if reads >= 6:
+                    out["objectID"] = True
+            return httpx.Response(200, json={"entity": out})
+        return httpx.Response(200, json={"result": -12})
+
+    c = ips.IpsClient("http://x", "u", "p")
+    c._token = "t"
+    c._http = handler_with(handler)
+    server = McpServer(c, {}, enable_write=True)
+    prep = server._by_name["ips_prepare_checkout_object"]["call"]({"object_id": 12})
+    server._by_name["ips_commit_checkout_object"]["call"]({"request_id": prep["request_id"]})
+    finish = server._by_name["ips_prepare_finish_checkout"]["call"]({"working_copy_id": -12, "action": "checkin"})
+    out = server._by_name["ips_commit_finish_checkout"]["call"]({"request_id": finish["request_id"]})
+    assert out["status"] == "partial_unknown" and out["stage"] == "checkIn_preflight"
+    assert "/core/api/objects/-12/saveChanges" in calls
+    assert "/core/api/objects/-12/checkIn" not in calls
+
+
+def test_relation_requires_active_matching_checkout():
+    from ips_mcp.server import McpServer
+    calls = []
+    relation_requests = []
+    obj = {"objectID": 12, "objectGUID": "g", "objectType": 7,
+           "caption": "part", "checkoutBy": 0}
+    state = {"active": False}
+
+    def handler(request):
+        calls.append(request.url.path)
+        if request.method == "GET" and request.url.path.endswith("/currentUsers/userInfo"):
+            return httpx.Response(200, json={"userVersionId": 1})
+        if request.method == "GET":
+            out = dict(obj)
+            if request.url.path.endswith("/-12") and state["active"]:
+                out["objectID"] = -12
+                out["checkoutBy"] = 1
+            return httpx.Response(200, json={"entity": out})
+        if request.url.path == "/core/api/relations":
+            relation_requests.append(request)
+            return httpx.Response(200, json={"result": {}})
+        if request.url.path.endswith("/checkOut"):
+            state["active"] = True
+            return httpx.Response(200, json={"result": -12})
+        return httpx.Response(200, json={"result": {}})
+
+    c = ips.IpsClient("http://x", "u", "p")
+    c._token = "t"
+    c._http = handler_with(handler)
+    server = McpServer(c, {}, enable_write=True)
+    schema = server._by_name["ips_prepare_create_relation"]["inputSchema"]["properties"]
+    assert "minimum" not in schema["project_version_id"]
+    assert schema["relation_type_id"]["minimum"] == 0
+    assert schema["part_version_id"]["minimum"] == 0
+    args = {"relation_type_id": 1, "project_version_id": -12, "part_version_id": 3}
+    before = len(calls)
+    try:
+        server._by_name["ips_prepare_create_relation"]["call"](args)
+    except ips.IpsError:
+        pass
+    else:
+        raise AssertionError("relation allowed with no checkout")
+    assert len(calls) == before
+    checkout = server._by_name["ips_prepare_checkout_object"]["call"]({"object_id": 12})
+    server._by_name["ips_commit_checkout_object"]["call"]({"request_id": checkout["request_id"]})
+    relation = server._by_name["ips_prepare_create_relation"]["call"](args)
+    server._by_name["ips_commit_create_relation"]["call"]({"request_id": relation["request_id"]})
+    request = relation_requests[-1]
+    assert request.url.path == "/core/api/relations"
+    assert request.url.params["isNeedToLogModificationHistory"] == "true"
+    assert json.loads(request.content) == {"relationType": 1, "projVersionId": -12, "partVersionId": 3}
+
+    relation = server._by_name["ips_prepare_create_relation"]["call"]({
+        **args, "attribute_values": [{"attributeID": 8, "values": [4]}]})
+    server._by_name["ips_commit_create_relation"]["call"]({"request_id": relation["request_id"]})
+    assert json.loads(relation_requests[-1].content)["attributeValues"] == [{"attributeId": 8, "values": [4]}]
+
+
+def test_mutation_401_is_not_retried():
+    calls = []
+    def handler(request):
+        calls.append(request.url.path)
+        return httpx.Response(401)
+    c = ips.IpsClient("http://x", "u", "p")
+    c._token = "t"
+    c._http = handler_with(handler)
+    try:
+        ips.write_attribute(c, 1, 2, "x")
+    except ips.IpsError:
+        pass
+    else:
+        raise AssertionError("401 mutation must fail")
+    assert calls == ["/core/api/objects/1/checkOut"], calls
+
+
+def test_create_object_tool_schema_fields_are_siblings():
+    from ips_mcp.server import McpServer
+    server = McpServer(ips.IpsClient("http://x", "u", "p"), {}, enable_write=True)
+    schema = server._by_name["ips_prepare_create_object"]["inputSchema"]
+    props = schema["properties"]
+    assert "context_rule" in props and "current_project" in props
+    assert "current_project" not in props["context_rule"]["properties"]
+
+
+def test_delete_is_allowlisted_once_and_never_retries():
+    from ips_mcp.server import McpServer
+    identity = {"objectID": 1406301, "objectGUID": "25fe60ea-a218-4278-90f0-542128d7ef03"}
+    calls = []
+    responses = []
+
+    def handler(request):
+        calls.append((request.method, request.url.path, dict(request.url.params)))
+        if request.url.path.endswith("/delete"):
+            return responses.pop(0)
+        obj = dict(identity)
+        if identity.get("race"):
+            obj["objectGUID"] = "different"
+        return httpx.Response(200, json={"entity": obj})
+
+    c = ips.IpsClient("http://x", "u", "p")
+    c._token = "t"
+    c._http = handler_with(handler)
+    server = McpServer(c, {}, enable_write=True)
+    prepare = server._by_name["ips_prepare_delete_object"]["call"]
+    commit = server._by_name["ips_commit_delete_object"]["call"]
+    args = {"object_id": identity["objectID"], "object_guid": identity["objectGUID"]}
+    preview = prepare(args)
+    assert len(calls) == 1 and not any(p.endswith("/delete") for _, p, _ in calls)
+    for bad in ({**args, "object_id": True}, {**args, "object_guid": 1406301},
+                {**args, "object_id": 1406302}, {**args, "object_guid": "wrong"}):
+        try:
+            prepare(bad)
+        except ips.IpsError:
+            pass
+        else:
+            raise AssertionError("unapproved delete identity accepted")
+    for response_entity in (
+            {"id": 1406301, "versionID": 1406301, "objectGUID": args["object_guid"]},
+            {"objectID": 1406302, "id": 1406301, "versionID": 1406301,
+             "objectGUID": args["object_guid"]}):
+        c._http = handler_with(lambda request, entity=response_entity:
+                               httpx.Response(200, json={"entity": entity}))
+        try:
+            prepare(args)
+        except ips.IpsError:
+            pass
+        else:
+            raise AssertionError("missing or mismatched delete path objectID accepted")
+    c._http = handler_with(handler)
+    responses.append(httpx.Response(200, json={"result": {}}))
+    out = commit({"request_id": preview["request_id"]})
+    assert out["status"] == "ok"
+    assert calls[-1] == ("POST", "/core/api/objects/1406301/delete",
+                         {"deleteMode": "0", "isNeedToLogModificationHistory": "true"})
+    before = len(calls)
+    try:
+        commit({"request_id": preview["request_id"]})
+    except ips.IpsError:
+        pass
+    else:
+        raise AssertionError("delete request was reusable")
+    assert len(calls) == before
+
+    for response in (httpx.Response(401), httpx.Response(500)):
+        pending = prepare(args)
+        responses.append(response)
+        before = len(calls)
+        out = commit({"request_id": pending["request_id"]})
+        assert out["status"] == "unknown"
+        assert len(calls) == before + 2
+        assert calls[-1][1].endswith("/delete")
+
+    pending = prepare(args)
+    def broken_transport(request):
+        if request.url.path.endswith("/delete"):
+            raise httpx.ConnectError("lost", request=request)
+        return httpx.Response(200, json={"entity": dict(identity)})
+    c._http = handler_with(broken_transport)
+    out = commit({"request_id": pending["request_id"]})
+    assert out["status"] == "unknown"
+
+    pending = prepare(args)
+    identity["race"] = True
+    c._http = handler_with(handler)
+    before = len(calls)
+    out = commit({"request_id": pending["request_id"]})
+    assert out["status"] == "pre_send_rejected"
+    assert not any(p.endswith("/delete") for _, p, _ in calls[before:])
+
+    identity["race"] = False
+    pending = prepare(args)
+    def mismatched_path_id(request):
+        return httpx.Response(200, json={"entity": {"objectID": 1406302,
+                                                       "id": 1406301,
+                                                       "versionID": 1406301,
+                                                       "objectGUID": args["object_guid"]}})
+    c._http = handler_with(mismatched_path_id)
+    before = len(calls)
+    out = commit({"request_id": pending["request_id"]})
+    assert out["status"] == "pre_send_rejected"
+    assert not any(p.endswith("/delete") for _, p, _ in calls[before:])
+
+
 def test_config_file_loading(tmpdir_factory=None):
     import tempfile
     from ips_mcp.server import load_config

@@ -49,6 +49,7 @@ class IpsClient:
 
     def _request_locked(self, method, path, **kw):
         retry = kw.pop("_retry", True)
+        no_auth_retry = kw.pop("_no_auth_retry", False)
         for attempt in range(2):
             headers = dict(kw.pop("headers", {}))
             if self._token:
@@ -61,7 +62,7 @@ class IpsClient:
                     time.sleep(0.3)
                     continue
                 raise IpsError(0, f"сетевая ошибка: {type(e).__name__}", path)
-            if resp.status_code == 401 and attempt == 0:
+            if resp.status_code == 401 and attempt == 0 and not no_auth_retry:
                 if self._refresh:
                     self._refresh_tokens()
                 else:
@@ -74,6 +75,14 @@ class IpsClient:
                 raise IpsError(resp.status_code, resp.text[:500], path)
             return resp.json()
         raise IpsError(0, "запрос не удался после повторов", path)
+
+    def mutation(self, method, path, **kw):
+        """Authenticate first, then make exactly one mutation request."""
+        with self._lock:
+            if not self._token:
+                self._authenticate()
+            return self._request_locked(method, path, _retry=False,
+                                        _no_auth_retry=True, **kw)
 
     def _authenticate(self):
         resp = self._http.post(self._base + "/core/api/Auth/authenticate", json={
@@ -212,26 +221,26 @@ def write_attribute(client, object_id, attribute_id, value):
     wc = None
     checked_in = False
     try:
-        wc = client.request(
-            "POST", f"/core/api/objects/{object_id}/checkOut", _retry=False,
+        wc = client.mutation(
+            "POST", f"/core/api/objects/{object_id}/checkOut",
             params={"isNeedToLogModificationHistory": True}, json={}).get("result")
-        if not isinstance(wc, int) or wc >= 0:
+        if isinstance(wc, bool) or not isinstance(wc, int):
             raise IpsError(500, f"checkOut вернул неверный workingCopyId: {wc!r}",
                            f"/core/api/objects/{object_id}/checkOut")
-        client.request("POST", f"/core/api/objects/{wc}/edit", _retry=False,
+        client.mutation("POST", f"/core/api/objects/{wc}/edit",
                        params={"isNeedToLogModificationHistory": True}, json={})
-        client.request("POST", f"/core/api/objects/{wc}/attributes", _retry=False,
+        client.mutation("POST", f"/core/api/objects/{wc}/attributes",
                        json=[{"attributeID": attribute_id, "values": [value]}])
-        client.request("POST", f"/core/api/objects/{wc}/saveChanges", _retry=False,
+        client.mutation("POST", f"/core/api/objects/{wc}/saveChanges",
                        params={"isNeedToLogModificationHistory": True}, json={})
-        version = client.request("POST", f"/core/api/objects/{wc}/checkIn", _retry=False,
+        version = client.mutation("POST", f"/core/api/objects/{wc}/checkIn",
                                  params={"isNeedToLogModificationHistory": True}, json={}).get("result")
         checked_in = True
         return {"objectId": object_id, "workingCopyId": wc, "versionId": version}
     except Exception:
-        if not checked_in and isinstance(wc, int) and wc < 0:
+        if not checked_in and isinstance(wc, int) and not isinstance(wc, bool):
             try:
-                client.request("POST", "/core/api/objects/cancelChanges", _retry=False,
+                client.mutation("POST", "/core/api/objects/cancelChanges",
                                params={"isNeedToLogModificationHistory": True,
                                        "isNeedToIgnoreExceptions": True},
                                json=[wc])

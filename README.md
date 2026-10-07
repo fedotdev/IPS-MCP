@@ -8,8 +8,8 @@ MCP-сервер для доступа к [IPS Web API](https://www.intermech.ru
 
 ## Возможности
 
-- **12 read-only инструментов**: объекты, состав, связи, метаданные, жизненный цикл.
-- **Двухфазная запись** (опционально): `preview → commit` с одноразовым подтверждением, без автоматических повторов.
+- **Read-only инструменты**: объекты, безопасный поиск, состав, связи, метаданные, жизненный цикл.
+- **Двухфазная запись** (опционально): `ips_prepare_* → ips_commit_*` для атрибута, checkout/finish checkout, создания объекта (в том числе по прототипу)/связи и узкого удаления; одноразовое подтверждение.
 - **JWT-авторизация**: lazy-вход и refresh после `401` без гонок; повтор только на сетевые ошибки и 5xx, не на 4xx и не на запись.
 - **База знаний `gloss.db`**: ID типов/атрибутов/связей дополняются именами из сгенерированного справочника.
 - **`ftObjectLink` разворачивается** в `{id, objectType, objectTypeName, caption}` (до 10 ссылок на вызов).
@@ -27,11 +27,12 @@ MCP-сервер для доступа к [IPS Web API](https://www.intermech.ru
 | Состав | `ips_get_composition`, `ips_get_composition_filtered`, `ips_get_composition_tree` |
 | Связи | `ips_get_relation`, `ips_get_relation_attributes` |
 | Метаданные | `ips_get_object_type`, `ips_get_attribute_type`, `ips_get_relation_type`, `ips_get_lifecycle` |
-| Запись* | `ips_prepare_update_attribute`, `ips_commit_update_attribute` |
+| Поиск | `ips_search_objects` |
+| Запись* | `ips_prepare_checkout_object`, `ips_commit_checkout_object`, `ips_prepare_finish_checkout`, `ips_commit_finish_checkout`, update/create/create-by-prototype tools и delete tools |
 
-\* Доступны только при `IPS_ENABLE_WRITE=1`.
+\* Все write tools доступны только при `IPS_ENABLE_WRITE=1`; delete allowlist — ровно objectID=1406301/objectGUID=25fe60ea-a218-4278-90f0-542128d7ef03.
 
-> По умолчанию сервер — strictly read-only. Запись включена явным флагом и ограничена изменением одного атрибута.
+> По умолчанию сервер — strictly read-only. Запись включена явным флагом и ограничена подтверждёнными операциями над атрибутами, объектами и связями.
 
 ## Требования
 
@@ -114,12 +115,26 @@ ips_prepare_update_attribute(object_id, attribute_id, value)
 ips_commit_update_attribute(request_id)
     → повторная проверка старого значения → checkout → edit → attributes
     → saveChanges → checkIn → verify-read
+
+ips_prepare_checkout_object(object_id) → ips_commit_checkout_object(request_id)
+    → отдельный checkout; используйте полученный workingCopyId без изменений
+ips_prepare_create_by_prototype(prototype_id) → ips_commit_create_by_prototype(request_id)
+    → CreateByPrototype → commitCreation(relatedObjectIds из ответа API)
+ips_prepare_finish_checkout(working_copy_id, action=checkin|cancel)
+    → ips_commit_finish_checkout(request_id)
 ```
 
 - Коммит автоматически делает `cancelChanges`, если операция упала после checkout.
 - Write-запросы **не ретраятся** (в отличие от чтения).
 - Одноразовый `request_id` исключает повторную запись по одному подтверждению.
-- Отклонение preview не вызывает side-эффектов: до commit никаких изменений в IPS не происходит.
+- `ips_prepare_*` не вызывает side-эффектов в IPS; запись выполняется только соответствующим `ips_commit_*`.
+- Ошибка после начала create возвращается как `partial_unknown`: результат в IPS неизвестен, повторять commit нельзя.
+- Создание по прототипу сохраняет отрицательные `relatedObjectIds` из ответа `CreateByPrototype` и передаёт их в `commitCreation`; при неизвестном результате сверяйте рабочую копию и не повторяйте.
+- Создание связи через `ips_commit_create_relation` напрямую меняет состав; автоматических checkout/checkin родителя нет.
+- Для безопасного изменения состава сначала выполните checkout родителя, передайте его workingCopyId как `project_version_id` при создании связи, затем завершите checkout через finish tools.
+- Checkin делает saveChanges, затем checkIn. При partial/unknown исходе ничего не повторяйте вслепую; проверьте состояние через read tools.
+- Checkout/finish и relation требуют активного checkout, записанного в памяти этого процесса; arbitrary workingCopyId отклоняется, а активные leases теряются после рестарта.
+- Удаление необратимо; cascade semantics не проверена. При `unknown`/`partial_unknown` проверьте состояние read-only через `ips_get_object`, не повторяйте вслепую.
 
 > Комментарий к «Действиям над объектом» в IPS не передаётся: проверенный Swagger Web API
 > не содержит параметра комментария у этих endpoint'ов. Зачем сделано изменение — в аудит-логе MCP.
@@ -162,7 +177,7 @@ tests/test_ips.py
 
 ## Безопасность
 
-- Write по умолчанию отключён и ограничен одним атрибутом при явном `IPS_ENABLE_WRITE=1`.
+- Write по умолчанию отключён и доступен только при явном `IPS_ENABLE_WRITE=1`.
 - Токены IPS живут только в памяти и не попадают ни в ответы MCP, ни в аудит.
 - Пароль хранится только в `config.json` (в `.gitignore`) либо в переменной окружения; в ответах MCP и аудит-логе его нет.
 - Права на операции остаются в IPS Web API; мост не дублирует бизнес-логику и не расширяет права.
@@ -171,4 +186,4 @@ tests/test_ips.py
 
 - `gloss.db` привязан к конкретной базе IPS; между базами требуется повторная выгрузка.
 - `ftObjectLink` разворачивается до 10 ссылок на вызов и возвращает `caption`, а не полный набор атрибутов.
-- Write поддерживает только изменение одного атрибута; создание объектов и связей, удаление и массовая запись не реализованы.
+- При ошибке между create и commit состояние возвращается как `partial_unknown`; delete-компенсация не выполняется.
