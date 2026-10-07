@@ -103,10 +103,12 @@ def read_sheet(path, table):
     """Читает Excel, возвращает (rows, source_modified_at)."""
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     ws = wb.active
-    raw = list(ws.iter_rows(values_only=True))
-    if len(raw) < 2:
+    rows_iter = ws.iter_rows(values_only=True)
+    next(rows_iter, None)  # строка отчёта
+    header = next(rows_iter, None)
+    if header is None:
         raise ValidationError(f"{path}: нет строк заголовка")
-    hdr = [(_cell(c) if c is not None else "") for c in raw[1]]
+    hdr = [(_cell(c) if c is not None else "") for c in header]
     colmap = COLUMNS[table]
 
     missing = [t for _, t, _ in colmap if t not in hdr]
@@ -116,7 +118,7 @@ def read_sheet(path, table):
     idx = {t: hdr.index(t) for _, t, _ in colmap}
 
     rows = []
-    for r in raw[2:]:
+    for r in rows_iter:
         rec = {}
         for field, title, kind in colmap:
             v = _cell(r[idx[title]])
@@ -130,6 +132,7 @@ def read_sheet(path, table):
             else:
                 rec[field] = v
         rows.append(rec)
+    wb.close()
     mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat()
     return rows, mtime
 
@@ -164,11 +167,13 @@ def main():
     errors = []
     data = {}
     source_files = []
+    source_mtimes = {}
     for f, table, _ in FILES:
         src = ROOT / f
         rows, mtime = read_sheet(src, table)
         validate(rows, table, errors)
         data[table] = rows
+        source_mtimes[table] = mtime
         source_files.append({"file": f, "modified_at": mtime, "table": table})
 
     if errors:
@@ -189,7 +194,7 @@ def main():
             for c in COLUMNS[table]:
                 values.append(r.get(c[0]))
             values.append(f)
-            values.append(source_files[[s["table"] for s in source_files].index(table)]["modified_at"])
+            values.append(source_mtimes[table])
             placeholders = ",".join("?" for _ in cols)
             conn.execute(
                 f"INSERT INTO {table} ({','.join(cols)}) VALUES ({placeholders})",

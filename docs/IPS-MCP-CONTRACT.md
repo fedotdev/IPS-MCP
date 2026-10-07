@@ -82,8 +82,3 @@ Swagger's `AttributeDto` exposes many response fields (including read-only field
 Delete разрешён только для точной пары `objectID=1406301` и `objectGUID=25fe60ea-a218-4278-90f0-542128d7ef03`: preview читает объект и проверяет оба поля, commit повторяет проверку непосредственно перед единственным `POST /core/api/objects/{objectId}/delete` с `deleteMode=0` (Swagger: зарезервировано) и `isNeedToLogModificationHistory=true`. Relations/children отдельно не удаляются. Операция необратима, cascade semantics не проверена. Ответ `unknown` означает сверить объект через read-only `ips_get_object`, не повторять commit. Инструменты существуют только при `IPS_ENABLE_WRITE=1`. Кодовая allowlist не подтверждает, что текущая конфигурация подключена к безопасной тестовой базе; config.json не читался.
 
 Обязательное текстовое поле комментария не добавляется: проверенный Swagger IPS Web API 1.0 не содержит параметра комментария у этих endpoint'ов, поэтому нельзя гарантировать запись текста в колонку «Комментарии» журнала IPS.
-
-## Отличие от устаревшего плана
-
-`GENERATED-PLAN.md` и `table` toolset из ТЗ описывали набор до фактической сверки.
-Настоящий контракт построен по реальному swagger.json и ему приоритет.

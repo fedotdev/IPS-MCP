@@ -367,8 +367,8 @@ def test_create_by_prototype_preserves_related_working_copy_ids_once():
     c._token = "t"
     c._http = handler_with(handler)
     server = McpServer(c, {}, enable_write=True)
-    prepare = server._by_name["ips_prepare_create_by_prototype"]["call"]
-    commit = server._by_name["ips_commit_create_by_prototype"]["call"]
+    prepare = server._by_name["ips_prepare_create_object"]["call"]
+    commit = server._by_name["ips_commit_create_object"]["call"]
     preview = prepare({"prototype_id": 100})
     assert preview["preview"]["prototype"] == "030 Prototype"
     assert len(calls) == 1  # preview только читает прототип
@@ -387,6 +387,30 @@ def test_create_by_prototype_preserves_related_working_copy_ids_once():
     else:
         raise AssertionError("prototype creation confirmation must be once")
     assert len(calls) == before
+
+
+def test_read_sheet_streams_rows_and_keeps_report_header_skip():
+    import tempfile
+    from pathlib import Path
+    from openpyxl import Workbook
+    sys.path.insert(0, os.path.abspath("."))
+    from gloss.generate_gloss import COLUMNS, read_sheet
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "objects.xlsx"
+        wb = Workbook()
+        ws = wb.active
+        ws.append(["Report title"])
+        ws.append([title for _, title, _ in COLUMNS["object_types"]])
+        values = []
+        for field, _, kind in COLUMNS["object_types"]:
+            value = 7 if field == "id" else "Test type" if field == "name" else None
+            values.append(value)
+        ws.append(values)
+        wb.save(path)
+
+        rows, _ = read_sheet(path, "object_types")
+        assert rows[0]["id"] == 7 and rows[0]["name"] == "Test type"
 
 
 def test_relation_transport_failure_is_partial_unknown_and_once():

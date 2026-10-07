@@ -329,7 +329,20 @@ def build_write_tools(client, gloss, store):
                 "inputSchema": spec["schema"], "call": handler}
 
     def create_prepare(a):
-        typ, attrs = a.get("object_type_id"), a.get("attributes", [])
+        typ, attrs, prototype_id = a.get("object_type_id"), a.get("attributes", []), a.get("prototype_id")
+        if prototype_id is not None:
+            if isinstance(prototype_id, bool) or not isinstance(prototype_id, int) or prototype_id < 0 or typ is not None or attrs:
+                raise ips.IpsError(400, "prototype_id нельзя сочетать с object_type_id/attributes", "/write/objects")
+            prototype = client.request("GET", f"/core/api/objects/{prototype_id}").get("entity") or {}
+            if prototype.get("objectID") != prototype_id:
+                raise ips.IpsError(404, "прототип не найден", f"/core/api/objects/{prototype_id}")
+            rid = store.put({"kind": "create", "prototype_id": prototype_id,
+                             "prototype_guid": prototype.get("objectGUID")})
+            return {"request_id": rid, "preview": {
+                "action": "create_object", "prototypeId": prototype_id,
+                "prototype": prototype.get("caption"), "operations": [
+                    "POST /core/api/objects/CreateByPrototype",
+                    "POST /core/api/objects/{workingCopyId}/commitCreation"]}}
         if isinstance(typ, bool) or not isinstance(typ, int) or typ < 0 or not isinstance(attrs, list) or len(attrs) > 100:
             raise ips.IpsError(400, "некорректные параметры создания объекта", "/write/objects")
         if any(not isinstance(x, dict) or set(x) != {"attributeID", "values"} or
@@ -361,6 +374,49 @@ def build_write_tools(client, gloss, store):
         rec = store.take(a["request_id"])
         if not rec or rec["kind"] != "create":
             raise ips.IpsError(409, "подтверждение отсутствует или уже использовано (once)", "/write/commit")
+        if "prototype_id" in rec:
+            prototype = client.request("GET", f"/core/api/objects/{rec['prototype_id']}").get("entity") or {}
+            if (prototype.get("objectID") != rec["prototype_id"] or
+                    prototype.get("objectGUID") != rec["prototype_guid"]):
+                return {"operation": "create_by_prototype", "status": "pre_send_rejected"}
+            try:
+                made = client.mutation("POST", "/core/api/objects/CreateByPrototype",
+                                      params={"isNeedToLogModificationHistory": True},
+                                      json={"prototypeId": rec["prototype_id"]})
+            except Exception as e:
+                return {"operation": "create_by_prototype", "status": "unknown",
+                        "stage": "create", "detail": str(e),
+                        "guidance": "Сверьте IPS read-only; не повторяйте вслепую."}
+            result = made.get("result") if isinstance(made, dict) else None
+            dto = result.get("objectDto") if isinstance(result, dict) else None
+            wc = dto.get("objectID") if isinstance(dto, dict) else None
+            related = result.get("relatedObjectIds", []) if isinstance(result, dict) else None
+            if (isinstance(wc, bool) or not isinstance(wc, int) or wc >= 0 or
+                    not isinstance(related, list) or
+                    any(isinstance(x, bool) or not isinstance(x, int) for x in related)):
+                return {"operation": "create_by_prototype", "status": "unknown",
+                        "stage": "create_response", "result": made}
+            try:
+                committed = client.mutation(
+                    "POST", f"/core/api/objects/{wc}/commitCreation",
+                    params={"isNeedToLogModificationHistory": True},
+                    json={"deleteOnException": False, "autoCheckout": False,
+                          "relatedObjectIds": related})
+                data = committed.get("result") if isinstance(committed, dict) else None
+                object_id = data.get("objectId") if isinstance(data, dict) else None
+                if isinstance(object_id, bool) or not isinstance(object_id, int):
+                    raise ips.IpsError(502, "commitCreation не вернул result.objectId",
+                                       f"/core/api/objects/{wc}/commitCreation")
+                return {"operation": "create_by_prototype", "status": "ok",
+                        "prototype_id": rec["prototype_id"], "working_copy_id": wc,
+                        "related_object_ids": related, "object_id": object_id,
+                        "result": committed}
+            except Exception as e:
+                return {"operation": "create_by_prototype", "status": "partial_unknown",
+                        "stage": "commitCreation", "prototype_id": rec["prototype_id"],
+                        "working_copy_id": wc, "related_object_ids": related,
+                        "detail": str(e),
+                        "guidance": "Проверьте рабочую копию; не повторяйте commit вслепую."}
         try:
             made = client.mutation("POST", "/core/api/objects", json=rec["payload"])
         except Exception as e:
@@ -751,12 +807,13 @@ def build_write_tools(client, gloss, store):
         }),
         make({
             "name": "ips_prepare_create_object",
-            "description": "Preview создания объекта без записи. Атрибуты ограничены минимальным форматом Swagger AttributeDto: attributeID и values.",
+            "description": "Preview создания объекта по типу/атрибутам или отдельной копии по prototype_id.",
             "schema": {
                 "type": "object",
                 "additionalProperties": False,
                 "properties": {
                     "object_type_id": {"type": "integer", "minimum": 0},
+                    "prototype_id": {"type": "integer", "minimum": 0},
                     "attributes": {
                         "type": "array", "maxItems": 100,
                         "items": {
@@ -789,20 +846,12 @@ def build_write_tools(client, gloss, store):
                         },
                     },
                 },
-                "required": ["object_type_id"],
+                "oneOf": [{"required": ["object_type_id"]}, {"required": ["prototype_id"]}],
             },
             "call": create_prepare,
         }),
         make({"name": "ips_commit_create_object", "description": "Одноразово создать объект и commitCreation.",
               "schema": {"type": "object", "additionalProperties": False, "properties": {"request_id": {"type": "string", "minLength": 1}}, "required": ["request_id"]}, "call": create_commit}),
-        make({"name": "ips_prepare_create_by_prototype", "description": "Проверить прототип и показать preview создания его отдельной копии; записи не выполняет.",
-              "schema": {"type": "object", "additionalProperties": False,
-                         "properties": {"prototype_id": {"type": "integer", "minimum": 0}},
-                         "required": ["prototype_id"]}, "call": create_by_prototype_prepare}),
-        make({"name": "ips_commit_create_by_prototype", "description": "Однократно создать отдельную копию прототипа и выполнить commitCreation с исходными relatedObjectIds. При unknown не повторять.",
-              "schema": {"type": "object", "additionalProperties": False,
-                         "properties": {"request_id": {"type": "string", "minLength": 1}},
-                         "required": ["request_id"]}, "call": create_by_prototype_commit}),
         make({"name": "ips_prepare_create_relation", "description": "Preview создания связи без записи.",
               "schema": {"type": "object", "additionalProperties": False,
                            "properties": {"relation_type_id": {"type": "integer", "minimum": 0}, "project_version_id": {"type": "integer"}, "part_version_id": {"type": "integer", "minimum": 0}, "attribute_values": {"type": "array", "maxItems": 100, "items": {"type": "object", "additionalProperties": False, "properties": {"attributeID": {"type": "integer", "minimum": 0}, "values": {"type": "array", "maxItems": 100}}, "required": ["attributeID", "values"]}}},
