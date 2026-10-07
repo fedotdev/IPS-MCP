@@ -662,7 +662,8 @@ def build_write_tools(client, gloss, store):
             except Exception as e:
                 return {"operation": "finish_checkout", "status": "unknown", "action": action, "detail": str(e)}
         try:
-            saved = client.mutation("POST", f"/core/api/objects/{wc}/saveChanges", json={})
+            saved = client.mutation("POST", f"/core/api/objects/{wc}/saveChanges",
+                                    params={"isNeedToLogModificationHistory": True}, json={})
         except Exception as e:
             return {"operation": "finish_checkout", "status": "unknown", "stage": "saveChanges", "detail": str(e)}
         try:
@@ -670,7 +671,8 @@ def build_write_tools(client, gloss, store):
         except Exception as e:
             return {"operation": "finish_checkout", "status": "partial_unknown", "stage": "checkIn_preflight", "saveChanges": saved, "detail": str(e)}
         try:
-            checked = client.mutation("POST", f"/core/api/objects/{wc}/checkIn", json={})
+            checked = client.mutation("POST", f"/core/api/objects/{wc}/checkIn",
+                                      params={"isNeedToLogModificationHistory": True}, json={})
         except Exception as e:
             return {"operation": "finish_checkout", "status": "partial_unknown", "stage": "checkIn", "saveChanges": saved, "detail": str(e)}
         try:
@@ -828,8 +830,11 @@ class McpServer:
         return {"jsonrpc": "2.0", "id": msg_id, "result": result}
 
     def _tool_error(self, msg_id, text):
+        # MCP: isError живёт внутри result. Верхнеуровневый isError оставлен
+        # для обратной совместимости с существующими тестами.
         return {"jsonrpc": "2.0", "id": msg_id, "isError": True,
-                "result": {"content": [{"type": "text", "text": text}]}}
+                "result": {"isError": True,
+                           "content": [{"type": "text", "text": text}]}}
 
     def handle(self, msg):
         if not isinstance(msg, dict) or "id" not in msg:
@@ -862,6 +867,12 @@ class McpServer:
             status = "ok"
             try:
                 out = tool["call"](args)
+                # commit-инструменты возвращают исход в out["status"]:
+                # unknown / partial_unknown / pre_send_rejected не должны
+                # попадать в аудит как «ok».
+                if (name.startswith("ips_commit_") and isinstance(out, dict)
+                        and out.get("status") not in (None, "ok")):
+                    status = str(out["status"])
                 text = json.dumps(out, ensure_ascii=False, indent=2)
                 result = {
                     "jsonrpc": "2.0", "id": rid,
