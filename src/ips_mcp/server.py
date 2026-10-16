@@ -74,6 +74,12 @@ def build_tools(client, gloss):
     get_obj = lambda path: client.request(
         "GET", path).get("entity") or {}
 
+    def server_version(c, g, a):
+        # версия приходит заголовком ips-version; дешёвый запрос гарантирует,
+        # что клиент уже сходил в IPS и заголовок захвачен
+        c.request("GET", "/core/api/currentUsers/userInfo")
+        return {"baseUrl": c.base_url, "ipsVersion": c.version}
+
     def search(c, g, a):
         object_type = a["object_type_id"]
         attrs = a.get("attribute_ids_to_select", [])
@@ -113,6 +119,12 @@ def build_tools(client, gloss):
             "description": "Показать пользователя, роль и уровень доступа текущей сессии IPS, без выдачи токенов.",
             "schema": {"type": "object", "properties": {}, "required": []},
             "call": lambda c, g, a: c.request("GET", "/core/api/currentUsers/userInfo"),
+        },
+        {
+            "name": "ips_get_server_version",
+            "description": "Получить версию сервера IPS (заголовок ips-version) и адрес Web API.",
+            "schema": {"type": "object", "properties": {}, "required": []},
+            "call": server_version,
         },
         {
             "name": "ips_get_object",
@@ -879,9 +891,9 @@ class McpServer:
         return {"jsonrpc": "2.0", "id": msg_id, "result": result}
 
     def _tool_error(self, msg_id, text):
-        # MCP: isError живёт внутри result. Верхнеуровневый isError оставлен
-        # для обратной совместимости с существующими тестами.
-        return {"jsonrpc": "2.0", "id": msg_id, "isError": True,
+        # MCP: isError живёт внутри result. Верхнеуровневое поле не добавляем —
+        # строгие клиенты (opencode) на нестандартный ответ вешаются в таймаут.
+        return {"jsonrpc": "2.0", "id": msg_id,
                 "result": {"isError": True,
                            "content": [{"type": "text", "text": text}]}}
 

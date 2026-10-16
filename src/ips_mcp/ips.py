@@ -42,6 +42,17 @@ class IpsClient:
         self._lock = threading.Lock()
         self._token = None
         self._refresh = None
+        self.version = None  # заголовок ips-version с любого ответа сервера
+
+    @property
+    def base_url(self):
+        return self._base
+
+    def _capture_version(self, resp):
+        if self.version is None:
+            v = resp.headers.get("ips-version")
+            if v:
+                self.version = v
 
     def request(self, method, path, **kw):
         with self._lock:
@@ -62,6 +73,7 @@ class IpsClient:
                     time.sleep(0.3)
                     continue
                 raise IpsError(0, f"сетевая ошибка: {type(e).__name__}", path)
+            self._capture_version(resp)
             if resp.status_code == 401 and attempt == 0 and not no_auth_retry:
                 if self._refresh:
                     self._refresh_tokens()
@@ -93,6 +105,7 @@ class IpsClient:
             "accessLevelID": self._access_level_id,
         })
         resp.raise_for_status()
+        self._capture_version(resp)
         d = resp.json()
         self._token = d["accessToken"]
         self._refresh = d["refreshToken"]

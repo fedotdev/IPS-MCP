@@ -82,6 +82,20 @@ def test_404_mapping():
         raise AssertionError("ожидали IpsError")
 
 
+def test_captures_ips_version_header():
+    def handler(request):
+        return httpx.Response(200, json={"ok": 1},
+                              headers={"ips-version": "9.0.4.11310"})
+
+    c = ips.IpsClient("http://x", "u", "p")
+    c._token = "t"
+    c._http = handler_with(handler)
+    assert c.version is None
+    c.request("GET", "/core/api/currentUsers/userInfo")
+    assert c.version == "9.0.4.11310"
+    assert c.base_url == "http://x"
+
+
 def test_mapper():
     gloss = {
         "object_types": {1075: "Операция"},

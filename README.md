@@ -22,7 +22,7 @@ MCP-сервер для доступа к [IPS Web API](https://www.intermech.ru
 
 | Домен | Инструмент |
 |---|---|
-| Сессия | `ips_get_current_user` |
+| Сессия | `ips_get_current_user`, `ips_get_server_version` |
 | Объекты | `ips_get_object`, `ips_get_object_attributes` |
 | Состав | `ips_get_composition`, `ips_get_composition_filtered`, `ips_get_composition_tree` |
 | Связи | `ips_get_relation`, `ips_get_relation_attributes` |
