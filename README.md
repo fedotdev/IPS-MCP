@@ -66,7 +66,8 @@ ips-mcp init --force                        # перезаписать
   "IPS_LOGIN": "user_name",
   "IPS_PASSWORD": "user_password",
   "IPS_BASE_URL": "http://192.168.80.70:8080",
-  "IPS_ROLE_ID": 782041,
+  "IPS_ROLE_TECHNO_ID": 782041,
+  "IPS_ROLE_PROG_ID": 775358,
   "IPS_GLOSS_DB": "gloss/generated/gloss.db",
   "IPS_AUDIT_LOG": "",
   "IPS_ENABLE_WRITE": false
@@ -84,7 +85,9 @@ ips-mcp init --force                        # перезаписать
 | `IPS_LOGIN` | да | Имя пользователя IPS |
 | `IPS_PASSWORD` | да | Пароль пользователя IPS |
 | `IPS_BASE_URL` | нет | По умолчанию `http://192.168.80.70:8080` |
-| `IPS_ROLE_ID` | нет | ID роли при входе (по умолчанию `0`) |
+| `IPS_ROLE_TECHNO_ID` | нет | ID роли для чтения (инструмент `ips_set_role {"role": "techno"}`); fallback — `IPS_ROLE_ID` |
+| `IPS_ROLE_PROG_ID` | нет | ID роли для записи (`ips_set_role {"role": "prog"}`, в этой базе `775358` «Репликатор баз данных»); fallback — `IPS_ROLE_TECHNO_ID` |
+| `IPS_ROLE_ID` | нет | Устаревшее: роль при входе (по умолчанию `0`), если не заданы роли выше |
 | `IPS_GLOSS_DB` | нет | Путь к `gloss.db` (по умолчанию `gloss/generated/gloss.db`) |
 | `IPS_AUDIT_LOG` | нет | Путь к JSONL-журналу вызовов (пусто = не писать) |
 | `IPS_ENABLE_WRITE` | нет | `true` включает write-инструменты |

@@ -65,6 +65,53 @@ def test_refresh_after_token_expired():
                      "/core/api/objects/2"], calls
 
 
+def test_set_role_reauths_with_new_role():
+    seen = []
+
+    def handler(request):
+        if request.url.path == "/core/api/Auth/authenticate":
+            seen.append(json.loads(request.content)["roleID"])
+            return httpx.Response(200, json={"accessToken": "t%d" % len(seen),
+                                             "refreshToken": "r"})
+        return httpx.Response(200, json={"roleVersionId": 2})
+
+    c = ips.IpsClient("http://x", "u", "p", role_id=1)
+    c._http = handler_with(handler)
+    c.set_role(2)
+    assert seen == [2] and c._token == "t1"
+    c.set_role(2)  # та же роль — повторного входа нет
+    assert seen == [2]
+
+
+def test_set_role_tool_switches_and_validates():
+    from ips_mcp.server import McpServer
+
+    class FakeClient:
+        base_url = "http://x"
+        version = None
+
+        def __init__(self):
+            self.role = 1
+
+        def set_role(self, role_id):
+            self.role = role_id
+
+        def request(self, method, path, **kw):
+            return {"roleVersionId": self.role}
+
+    client = FakeClient()
+    server = McpServer(client, {}, roles={"techno": 1, "prog": 2})
+    out = server._by_name["ips_set_role"]["call"]({"role": "prog"})
+    assert out["roleId"] == 2 and out["user"]["roleVersionId"] == 2
+    assert client.role == 2
+    try:
+        server._by_name["ips_set_role"]["call"]({"role": "admin"})
+    except ips.IpsError:
+        pass
+    else:
+        raise AssertionError("неизвестная роль принята")
+
+
 def test_404_mapping():
     def handler(request):
         return httpx.Response(404, json={"detail": "нет объекта"})

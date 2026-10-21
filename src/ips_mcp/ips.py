@@ -76,7 +76,12 @@ class IpsClient:
             self._capture_version(resp)
             if resp.status_code == 401 and attempt == 0 and not no_auth_retry:
                 if self._refresh:
-                    self._refresh_tokens()
+                    try:
+                        self._refresh_tokens()
+                    except IpsError:
+                        # refresh-токен истёк/невалиден — входим заново по логину/паролю
+                        self._refresh = None
+                        self._authenticate()
                 else:
                     self._authenticate()
                 continue
@@ -95,6 +100,16 @@ class IpsClient:
                 self._authenticate()
             return self._request_locked(method, path, _retry=False,
                                         _no_auth_retry=True, **kw)
+
+    def set_role(self, role_id):
+        """Переключает роль и заново входит: токены привязаны к роли."""
+        with self._lock:
+            if role_id == self._role_id and self._token:
+                return
+            self._role_id = role_id
+            self._token = None
+            self._refresh = None
+            self._authenticate()
 
     def _authenticate(self):
         resp = self._http.post(self._base + "/core/api/Auth/authenticate", json={

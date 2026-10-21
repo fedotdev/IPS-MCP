@@ -878,10 +878,28 @@ def build_write_tools(client, gloss, store):
 
 
 class McpServer:
-    def __init__(self, client, gloss, audit_path=None, enable_write=False):
+    def __init__(self, client, gloss, audit_path=None, enable_write=False, roles=None):
         self._tools = build_tools(client, gloss)
         self._by_name = {t["name"]: t for t in self._tools}
         self._audit_path = audit_path
+        if roles:
+            def set_role(args):
+                key = args.get("role")
+                if key not in roles:
+                    raise ips.IpsError(400, f"неизвестная роль: {key}",
+                                       "/core/api/Auth/authenticate")
+                client.set_role(roles[key])
+                return {"role": key, "roleId": roles[key],
+                        "user": client.request("GET", "/core/api/currentUsers/userInfo")}
+            self._tools.append({
+                "name": "ips_set_role",
+                "description": "Переключить роль MCP: techno (чтение) или prog (запись).",
+                "inputSchema": {"type": "object", "additionalProperties": False,
+                                "properties": {"role": {"type": "string",
+                                                        "enum": sorted(roles)}},
+                                "required": ["role"]},
+                "call": set_role})
+            self._by_name = {t["name"]: t for t in self._tools}
         if enable_write:
             store = WriteStore()
             self._tools += build_write_tools(client, gloss, store)
@@ -957,6 +975,7 @@ class McpServer:
 
 
 CONFIG_ENV_KEYS = ("IPS_LOGIN", "IPS_PASSWORD", "IPS_BASE_URL", "IPS_ROLE_ID",
+                   "IPS_ROLE_TECHNO_ID", "IPS_ROLE_PROG_ID",
                    "IPS_GLOSS_DB", "IPS_AUDIT_LOG", "IPS_ENABLE_WRITE")
 
 
@@ -1005,7 +1024,10 @@ def run():
     base = os.environ.get("IPS_BASE_URL", DEFAULTS["IPS_BASE_URL"])
     login = os.environ.get("IPS_LOGIN")
     password = os.environ.get("IPS_PASSWORD")
-    role_id = int(os.environ.get("IPS_ROLE_ID", DEFAULTS["IPS_ROLE_ID"]))
+    role_techno = int(os.environ.get("IPS_ROLE_TECHNO_ID")
+                      or os.environ.get("IPS_ROLE_ID", DEFAULTS["IPS_ROLE_ID"]))
+    role_prog = int(os.environ.get("IPS_ROLE_PROG_ID") or role_techno)
+    role_id = int(os.environ.get("IPS_ROLE_ID") or role_techno)
     gloss_db = os.environ.get("IPS_GLOSS_DB",
                               os.path.join(PROJECT_ROOT, *DEFAULTS["IPS_GLOSS_DB"].split("/")))
     audit_path = os.environ.get("IPS_AUDIT_LOG")
@@ -1023,7 +1045,8 @@ def run():
     client = ips.IpsClient(base, login, password, role_id=role_id)
     gloss = ips.load_gloss(gloss_db) if os.path.exists(gloss_db) else {}
     server = McpServer(client, gloss, audit_path=audit_path,
-                       enable_write=enable_write)
+                       enable_write=enable_write,
+                       roles={"techno": role_techno, "prog": role_prog})
 
     sys.stderr.write(
         f"IPS-MCP: вход выполнен как {login} "

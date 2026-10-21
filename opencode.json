@@ -7,7 +7,8 @@
       "environment": {
         "PYTHONPATH": "src",
         "IPS_BASE_URL": "http://192.168.80.70:8080",
-        "IPS_ROLE_ID": "782041",
+        "IPS_ROLE_TECHNO_ID": "782041",
+        "IPS_ROLE_PROG_ID": "775358",
         "IPS_GLOSS_DB": "gloss/generated/gloss.db",
         "IPS_AUDIT_LOG": "C:\\Users\\fedor\\AppData\\Local\\Temp\\opencode\\ips-mcp-audit.jsonl"
       }
