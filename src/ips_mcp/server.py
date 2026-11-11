@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from . import ips
+from .debug import DebugLog
 
 KNOWN_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 
@@ -26,6 +27,7 @@ DEFAULTS = {
     "IPS_GLOSS_DB": "gloss/generated/gloss.db",
     "IPS_AUDIT_LOG": "",
     "IPS_ENABLE_WRITE": False,
+    "IPS_DEBUG_MODE": False,
 }
 
 PATH_FIELDS = ("IPS_GLOSS_DB", "IPS_AUDIT_LOG")
@@ -878,10 +880,12 @@ def build_write_tools(client, gloss, store):
 
 
 class McpServer:
-    def __init__(self, client, gloss, audit_path=None, enable_write=False, roles=None):
+    def __init__(self, client, gloss, audit_path=None, enable_write=False, roles=None,
+                 debug_dir=None):
         self._tools = build_tools(client, gloss)
         self._by_name = {t["name"]: t for t in self._tools}
         self._audit_path = audit_path
+        self._debug = DebugLog(debug_dir, client) if debug_dir is not None else None
         if roles:
             def set_role(args):
                 key = args.get("role")
@@ -904,6 +908,10 @@ class McpServer:
             store = WriteStore()
             self._tools += build_write_tools(client, gloss, store)
             self._by_name = {t["name"]: t for t in self._tools}
+        if self._debug:
+            client.debug_hook = self._debug.record_http
+            self._tools.append(self._debug.tool())
+            self._by_name = {t["name"]: t for t in self._tools}
 
     def _result(self, msg_id, result):
         return {"jsonrpc": "2.0", "id": msg_id, "result": result}
@@ -925,11 +933,14 @@ class McpServer:
         if method == "initialize":
             offer = next((p for p in params.get("supportedProtocolVersions", [])
                           if p in KNOWN_PROTOCOLS), KNOWN_PROTOCOLS[1])
-            return self._result(rid, {
+            result = {
                 "protocolVersion": offer,
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": "ips-mcp", "version": "0.1.0"},
-            })
+            }
+            if self._debug:
+                result["instructions"] = self._debug.instructions
+            return self._result(rid, result)
         if method == "ping":
             return self._result(rid, {})
         if method == "tools/list":
@@ -940,35 +951,54 @@ class McpServer:
             name = params.get("name")
             args = params.get("arguments") or {}
             tool = self._by_name.get(name)
-            if tool is None:
-                return self._tool_error(rid, f"неизвестный инструмент: {name}")
             t0 = time.monotonic()
             status = "ok"
+            out = error = None
+            if self._debug:
+                self._debug.start_call()
             try:
-                out = tool["call"](args)
-                # commit-инструменты возвращают исход в out["status"]:
-                # unknown / partial_unknown / pre_send_rejected не должны
-                # попадать в аудит как «ok».
-                if (name.startswith("ips_commit_") and isinstance(out, dict)
-                        and out.get("status") not in (None, "ok")):
-                    status = str(out["status"])
-                text = json.dumps(out, ensure_ascii=False, indent=2)
-                result = {
-                    "jsonrpc": "2.0", "id": rid,
-                    "result": {"content": [{"type": "text", "text": text}]}}
+                if tool is None:
+                    status = "error"
+                    error = {"type": "UnknownTool", "detail": f"неизвестный инструмент: {name}"}
+                    result = self._tool_error(rid, error["detail"])
+                else:
+                    out = tool["call"](args)
+                    # Неопределённый исход commit не является успешным вызовом.
+                    if (name.startswith("ips_commit_") and isinstance(out, dict)
+                            and out.get("status") not in (None, "ok")):
+                        status = str(out["status"])
+                    text = json.dumps(out, ensure_ascii=False, indent=2)
+                    result = self._result(rid, {"content": [{"type": "text", "text": text}]})
             except ips.IpsError as e:
                 status = "error"
+                error = {"type": type(e).__name__, "status": e.status,
+                         "path": e.path, "detail": e.detail}
                 result = self._tool_error(rid, str(e) + f"\nIPS detail: {e.detail}")
             except Exception as e:  # never show tokens/creds to client
                 status = "error"
+                error = {"type": type(e).__name__, "detail": str(e)}
                 result = self._tool_error(rid, f"внутренняя ошибка: {type(e).__name__}")
-            _audit_line(self._audit_path, {
+            record = {
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "tool": name,
                 "inputs": args,
                 "duration_ms": round((time.monotonic() - t0) * 1000),
                 "status": status,
-            })
+            }
+            if self._audit_path:
+                try:
+                    _audit_line(self._audit_path, self._debug.redact(record) if self._debug else record)
+                except Exception as e:
+                    sys.stderr.write(f"IPS-MCP: аудит не записан ({type(e).__name__}).\n")
+            if self._debug:
+                debug_info = self._debug.record_call({**record, "output": out, "error": error})
+                if debug_info:
+                    result["result"]["_meta"] = {"ips_debug": debug_info}
+                    note = (f"DEBUG evidence_call_id: {debug_info['call_id']}. "
+                            "В конце задачи сохраните новые выводы через ips_save_debug_case.")
+                else:
+                    note = "DEBUG: вызов не сохранён; причина указана в stderr сервера."
+                result["result"]["content"].append({"type": "text", "text": note})
             return result
 
         return self._tool_error(rid, f"метод не поддерживается: {method}")
@@ -976,7 +1006,7 @@ class McpServer:
 
 CONFIG_ENV_KEYS = ("IPS_LOGIN", "IPS_PASSWORD", "IPS_BASE_URL", "IPS_ROLE_ID",
                    "IPS_ROLE_TECHNO_ID", "IPS_ROLE_PROG_ID",
-                   "IPS_GLOSS_DB", "IPS_AUDIT_LOG", "IPS_ENABLE_WRITE")
+                   "IPS_GLOSS_DB", "IPS_AUDIT_LOG", "IPS_ENABLE_WRITE", "IPS_DEBUG_MODE")
 
 
 def default_config_path():
@@ -1020,7 +1050,8 @@ def run():
     # MCP stdio uses UTF-8; Windows console defaults (e.g. cp1251) cannot encode tool descriptions.
     sys.stdin.reconfigure(encoding="utf-8")
     sys.stdout.reconfigure(encoding="utf-8")
-    load_config(default_config_path())
+    config_path = default_config_path()
+    load_config(config_path)
     base = os.environ.get("IPS_BASE_URL", DEFAULTS["IPS_BASE_URL"])
     login = os.environ.get("IPS_LOGIN")
     password = os.environ.get("IPS_PASSWORD")
@@ -1032,6 +1063,8 @@ def run():
                               os.path.join(PROJECT_ROOT, *DEFAULTS["IPS_GLOSS_DB"].split("/")))
     audit_path = os.environ.get("IPS_AUDIT_LOG")
     enable_write = os.environ.get("IPS_ENABLE_WRITE", "").strip().lower() in {"1", "true", "yes", "on"}
+    debug_mode = os.environ.get("IPS_DEBUG_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
+    debug_dir = os.path.join(os.path.dirname(os.path.abspath(config_path)), "debug") if debug_mode else None
     if not login or not password:
         sys.stderr.write(
             "IPS_LOGIN и IPS_PASSWORD обязательны\n"
@@ -1046,13 +1079,16 @@ def run():
     gloss = ips.load_gloss(gloss_db) if os.path.exists(gloss_db) else {}
     server = McpServer(client, gloss, audit_path=audit_path,
                        enable_write=enable_write,
-                       roles={"techno": role_techno, "prog": role_prog})
+                       roles={"techno": role_techno, "prog": role_prog},
+                       debug_dir=debug_dir)
 
     sys.stderr.write(
         f"IPS-MCP: вход выполнен как {login} "
         f"(роль {role_id}, базовый URL {base})\n"
         "IPS-MCP: ожидание MCP-запросов из stdin; "
         "stdout зарезервирован под протокол.\n")
+    if debug_mode:
+        sys.stderr.write(f"IPS-MCP: DEBUG MODE включён, журнал и кейсы: {debug_dir}\n")
 
     for line in sys.stdin:
         line = line.strip()
@@ -1110,6 +1146,7 @@ def init_config(argv=None):
         "IPS_GLOSS_DB": os.environ.get("IPS_GLOSS_DB", DEFAULTS["IPS_GLOSS_DB"]),
         "IPS_AUDIT_LOG": os.environ.get("IPS_AUDIT_LOG", DEFAULTS["IPS_AUDIT_LOG"]),
         "IPS_ENABLE_WRITE": os.environ.get("IPS_ENABLE_WRITE", "").lower() in {"1", "true", "yes", "on"},
+        "IPS_DEBUG_MODE": os.environ.get("IPS_DEBUG_MODE", "").strip().lower() in {"1", "true", "yes", "on"},
     }
 
     for key, secret in (("IPS_LOGIN", False), ("IPS_PASSWORD", True)):

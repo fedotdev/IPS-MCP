@@ -43,6 +43,7 @@ class IpsClient:
         self._token = None
         self._refresh = None
         self.version = None  # заголовок ips-version с любого ответа сервера
+        self.debug_hook = None
 
     @property
     def base_url(self):
@@ -58,6 +59,13 @@ class IpsClient:
         with self._lock:
             return self._request_locked(method, path, **kw)
 
+    def _debug_request(self, method, path, kwargs, **result):
+        if self.debug_hook is not None:
+            try:
+                self.debug_hook(method, path, kwargs, **result)
+            except Exception as error:
+                log.warning("IPS-MCP DEBUG: HTTP-вызов не записан (%s)", type(error).__name__)
+
     def _request_locked(self, method, path, **kw):
         retry = kw.pop("_retry", True)
         no_auth_retry = kw.pop("_no_auth_retry", False)
@@ -69,11 +77,13 @@ class IpsClient:
                 resp = self._http.request(method, self._base + path,
                                           headers=headers, **kw)
             except httpx.HTTPError as e:
+                self._debug_request(method, path, kw, error=e)
                 if attempt == 0 and retry:
                     time.sleep(0.3)
                     continue
                 raise IpsError(0, f"сетевая ошибка: {type(e).__name__}", path)
             self._capture_version(resp)
+            self._debug_request(method, path, kw, response=resp)
             if resp.status_code == 401 and attempt == 0 and not no_auth_retry:
                 if self._refresh:
                     try:

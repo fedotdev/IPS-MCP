@@ -7,5 +7,6 @@
   "IPS_ROLE_PROG_ID": 0,
   "IPS_GLOSS_DB": "gloss/generated/gloss.db",
   "IPS_AUDIT_LOG": "",
-  "IPS_ENABLE_WRITE": false
+  "IPS_ENABLE_WRITE": false,
+  "IPS_DEBUG_MODE": false
 }
